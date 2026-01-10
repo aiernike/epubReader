@@ -37,6 +37,7 @@ import json
 import urllib.request
 import zipfile as zipfile_lib
 from pathlib import Path
+import uuid
 
 # ===== 配置选项 =====
 class AppConfig:
@@ -461,7 +462,9 @@ def convert_srt_to_lrc(srt_content, chars_per_line):
         lines = block.split('\n')
         if len(lines) >= 3 and lines[1].strip():
             time_line = lines[1]
-            text_line = lines[2]
+            # 支持多行字幕：合并第2行及之后的所有行
+            text_lines = lines[2:]
+            text_line = ''.join(text_lines)  # 直接拼接，不加空格
             match = re.search(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})', time_line)
             if match:
                 hours, minutes, seconds, milliseconds = map(int, match.groups())
@@ -819,6 +822,9 @@ def install_ffmpeg_from_zip(zip_file_path, progress_callback=None):
     if sys.platform != 'win32':
         return False, None, "自动安装仅支持Windows系统，请手动安装FFmpeg"
     
+    # 为此任务创建独立的临时目录
+    task_temp_dir = tempfile.mkdtemp(prefix='epubReader_ffmpeg_')
+    
     try:
         # 验证文件存在
         if not os.path.exists(zip_file_path):
@@ -853,8 +859,8 @@ def install_ffmpeg_from_zip(zip_file_path, progress_callback=None):
             namelist = zip_ref.namelist()
             root_dir = namelist[0].split('/')[0] if '/' in namelist[0] else namelist[0].split('\\')[0]
             
-            # 解压到临时目录
-            temp_extract = os.path.join(TEMP_DIR, 'ffmpeg_extract')
+            # 解压到独立的临时目录
+            temp_extract = os.path.join(task_temp_dir, 'ffmpeg_extract')
             if os.path.exists(temp_extract):
                 shutil.rmtree(temp_extract)
             
@@ -880,9 +886,6 @@ def install_ffmpeg_from_zip(zip_file_path, progress_callback=None):
             
             # 移动bin目录到目标位置
             shutil.move(source_bin, target_bin)
-            
-            # 清理临时文件
-            shutil.rmtree(temp_extract)
         
         if progress_callback:
             progress_callback(90, 100, "正在验证安装...")
@@ -911,6 +914,13 @@ def install_ffmpeg_from_zip(zip_file_path, progress_callback=None):
     
     except Exception as e:
         return False, None, f"安装失败: {str(e)}"
+    finally:
+        # 清理任务临时目录
+        try:
+            if os.path.exists(task_temp_dir):
+                shutil.rmtree(task_temp_dir)
+        except Exception as e:
+            print(f"清理临时目录失败: {e}")
 
 
 def download_ffmpeg(progress_callback=None, cancel_check=None):
@@ -926,14 +936,16 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
     if sys.platform != 'win32':
         return False, None, "自动安装仅支持Windows系统，请手动安装FFmpeg"
     
-    zip_path = None  # 在try外部定义，以侾finally块可以访问
+    # 为此任务创建独立的临时目录
+    task_temp_dir = tempfile.mkdtemp(prefix='epubReader_ffmpeg_dl_')
+    zip_path = None  # 在try外部定义，以便finally块可以访问
     
     try:
         # 创建安装目录
         os.makedirs(FFMPEG_DIR, exist_ok=True)
         
         # 下载文件
-        zip_path = os.path.join(TEMP_DIR, 'ffmpeg.zip')
+        zip_path = os.path.join(task_temp_dir, 'ffmpeg.zip')
         
         # 尝试多个下载源
         download_success = False
@@ -1059,7 +1071,7 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
             root_dir = namelist[0].split('/')[0] if '/' in namelist[0] else namelist[0].split('\\')[0]
             
             # 解压到临时目录
-            temp_extract = os.path.join(TEMP_DIR, 'ffmpeg_extract')
+            temp_extract = os.path.join(task_temp_dir, 'ffmpeg_extract')
             zip_ref.extractall(temp_extract)
             
             # 移动bin目录到目标位置
@@ -1101,12 +1113,12 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
     except Exception as e:
         return False, None, f"安装失败: {str(e)}"
     finally:
-        # 清理可能残留的临时文件
+        # 清理任务临时目录
         try:
-            if zip_path and os.path.exists(zip_path):
-                os.remove(zip_path)
-        except:
-            pass
+            if os.path.exists(task_temp_dir):
+                shutil.rmtree(task_temp_dir)
+        except Exception as e:
+            print(f"清理临时目录失败: {e}")
 
 
 def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_path=None, chapter_titles=None):
@@ -1123,6 +1135,9 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
     Returns:
         tuple: (success: bool, error_msg: str) 成功返回(True, None)，失败返回(False, 错误信息)
     """
+    # 为此任务创建独立的临时目录
+    task_temp_dir = tempfile.mkdtemp(prefix='epubReader_m4b_')
+    
     try:
         # Windows下隐藏控制台窗口的参数
         creation_flags = 0
@@ -1197,7 +1212,7 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             chapter_durations.append(duration)
         
         # 创建临时文件列表
-        list_file = os.path.join(TEMP_DIR, "m4b_filelist.txt")
+        list_file = os.path.join(task_temp_dir, "m4b_filelist.txt")
         with open(list_file, 'w', encoding='utf-8') as f:
             for mp3_file in mp3_files:
                 # FFmpeg的concat demuxer需要这种格式
@@ -1205,7 +1220,7 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
                 f.write(f"file '{escaped_path}'\n")
         
         # 生成章节元数据文件 (FFMETADATA格式)
-        metadata_file = os.path.join(TEMP_DIR, "m4b_chapters.txt")
+        metadata_file = os.path.join(task_temp_dir, "m4b_chapters.txt")
         with open(metadata_file, 'w', encoding='utf-8') as f:
             f.write(";FFMETADATA1\n")
             
@@ -1238,7 +1253,7 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
                 current_time_ms += duration_ms
         
         # 创建临时M4A文件（不带元数据）
-        temp_m4a = os.path.join(TEMP_DIR, "temp_audiobook.m4a")
+        temp_m4a = os.path.join(task_temp_dir, "temp_audiobook.m4a")
         
         # 第一步：合并所有MP3为M4A，并嵌入章节信息
         print("正在合并音频文件并添加章节信息...")
@@ -1278,7 +1293,7 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
         # 如果有封面，添加封面输入
         cover_file = None
         if cover_data:
-            cover_file = os.path.join(TEMP_DIR, "m4b_cover.jpg")
+            cover_file = os.path.join(task_temp_dir, "m4b_cover.jpg")
             with open(cover_file, 'wb') as f:
                 f.write(cover_data)
             metadata_cmd.extend(["-i", cover_file])
@@ -1321,19 +1336,6 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             print(f"FFmpeg添加元数据失败: {error_output}", file=sys.stderr)
             return False, error_msg
         
-        # 清理临时文件
-        try:
-            if os.path.exists(temp_m4a):
-                os.remove(temp_m4a)
-            if os.path.exists(list_file):
-                os.remove(list_file)
-            if os.path.exists(metadata_file):
-                os.remove(metadata_file)
-            if cover_file and os.path.exists(cover_file):
-                os.remove(cover_file)
-        except OSError as e:
-            print(f"清理临时文件失败: {e}")
-        
         print(f"M4B文件生成成功: {output_m4b}")
         return True, None
         
@@ -1342,6 +1344,13 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
         print(f"生成M4B文件时发生错误: {e}", file=sys.stderr)
         traceback.print_exc()
         return False, error_msg
+    finally:
+        # 清理任务临时目录
+        try:
+            if os.path.exists(task_temp_dir):
+                shutil.rmtree(task_temp_dir)
+        except Exception as e:
+            print(f"清理临时目录失败: {e}")
 
 
 # ===== 主GUI应用 =====
@@ -1663,7 +1672,8 @@ class EpubToMp3App:
             voice = self.voice_var.get()
             self.update_status("正在生成试听音频...")
             self.append_log(f"试听语音: {voice}")
-            preview_mp3 = os.path.join(TEMP_DIR, "tts_preview.mp3")
+            # 为试听创建独立的临时文件
+            preview_mp3 = tempfile.mktemp(suffix='.mp3', prefix='epubReader_preview_')
             try:
                 import asyncio
                 async def gen_preview():
@@ -2028,8 +2038,8 @@ class EpubToMp3App:
                 self.cover_label.config(image=photo, text="")
                 self.cover_label.image = photo  # 保持引用
 
-                # 保存封面文件到临时目录
-                cover_path = os.path.join(TEMP_DIR, "cover.jpg")
+                # 保存封面文件到临时目录（使用独立文件名）
+                cover_path = tempfile.mktemp(suffix='.jpg', prefix='epubReader_cover_')
                 with open(cover_path, "wb") as f:
                     f.write(image_data)
                 self.cover_path_var.set(cover_path)
@@ -2304,9 +2314,8 @@ class EpubToMp3App:
             messagebox.showerror("错误", f"章节 '{title}' 没有内容可转换。")
             return
 
-        # 创建临时目录
-        temp_dir = os.path.join(TEMP_DIR, "single_chapter")
-        os.makedirs(temp_dir, exist_ok=True)
+        # 为此章节创建独立的临时目录
+        temp_dir = tempfile.mkdtemp(prefix='epubReader_chapter_')
 
         # 保存章节内容到临时文件
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
