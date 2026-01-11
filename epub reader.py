@@ -38,6 +38,201 @@ import urllib.request
 import zipfile as zipfile_lib
 from pathlib import Path
 import uuid
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Callable, Any, Optional, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# ===== 统一任务调度层 =====
+class TaskType(Enum):
+    """任务类型"""
+    TTS = "tts"                  # TTS转换任务
+    FFMPEG = "ffmpeg"            # FFmpeg操作任务
+    DOWNLOAD = "download"        # 下载任务
+    PARSE_EPUB = "parse_epub"    # EPUB解析
+    GENERAL = "general"          # 通用任务
+
+
+@dataclass
+class Task:
+    """任务定义"""
+    task_id: str
+    task_type: TaskType
+    func: Callable                      # 要执行的函数（可以是普通函数或协程）
+    args: tuple = field(default_factory=tuple)
+    kwargs: Dict = field(default_factory=dict)
+    callback: Optional[Callable] = None          # 成功回调
+    error_callback: Optional[Callable] = None    # 错误回调
+    progress_callback: Optional[Callable] = None # 进度回调
+    cancellable: bool = True                     # 是否可取消
+
+
+class TaskScheduler:
+    """统一的后台任务调度器
+    
+    特性：
+    - 单一 Worker 线程运行所有后台任务
+    - 内部维护单一 asyncio 事件循环
+    - 支持任务队列、取消、进度回调
+    - 线程安全的任务提交和状态查询
+    """
+    
+    def __init__(self, max_concurrent_tts=3):
+        self.task_queue = queue.Queue()
+        self.result_queue = queue.Queue()
+        self.max_concurrent_tts = max_concurrent_tts
+        
+        # 任务管理
+        self.active_tasks: Dict[str, Task] = {}  # task_id -> Task
+        self.cancelled_tasks = set()              # 已取消的 task_id
+        self.task_lock = threading.Lock()
+        
+        # 事件循环和线程池
+        self.event_loop = None
+        self.worker_thread = None
+        self.tts_executor = None
+        self.running = False
+        
+    def start(self):
+        """启动调度器"""
+        if self.running:
+            return
+        
+        self.running = True
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop, 
+            daemon=True, 
+            name="TaskScheduler-Worker"
+        )
+        self.worker_thread.start()
+    
+    def stop(self):
+        """停止调度器"""
+        self.running = False
+        if self.event_loop:
+            try:
+                self.event_loop.call_soon_threadsafe(self.event_loop.stop)
+            except:
+                pass
+    
+    def submit_task(self, task: Task) -> str:
+        """提交任务（线程安全）
+        
+        Returns:
+            task_id: 任务ID
+        """
+        with self.task_lock:
+            self.active_tasks[task.task_id] = task
+        self.task_queue.put(task)
+        return task.task_id
+    
+    def cancel_task(self, task_id: str) -> bool:
+        """取消任务
+        
+        Returns:
+            bool: 是否成功标记为取消
+        """
+        with self.task_lock:
+            if task_id in self.active_tasks:
+                task = self.active_tasks[task_id]
+                if task.cancellable:
+                    self.cancelled_tasks.add(task_id)
+                    return True
+        return False
+    
+    def is_task_cancelled(self, task_id: str) -> bool:
+        """检查任务是否被取消"""
+        return task_id in self.cancelled_tasks
+    
+    def get_result(self):
+        """获取结果（非阻塞）
+        
+        Returns:
+            tuple: (task_id, success, result/error) 或 None
+        """
+        try:
+            return self.result_queue.get_nowait()
+        except queue.Empty:
+            return None
+    
+    def _worker_loop(self):
+        """Worker 线程主循环"""
+        # 创建专用的事件循环
+        self.event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.event_loop)
+        
+        # 创建TTS线程池（用于并发TTS任务）
+        self.tts_executor = ThreadPoolExecutor(
+            max_workers=self.max_concurrent_tts, 
+            thread_name_prefix="TTS-Worker"
+        )
+        
+        try:
+            while self.running:
+                try:
+                    # 获取任务（阻塞，超时1秒）
+                    task = self.task_queue.get(timeout=1.0)
+                    
+                    # 检查是否已取消
+                    if task.task_id in self.cancelled_tasks:
+                        self._cleanup_task(task.task_id, cancelled=True)
+                        if task.error_callback:
+                            self.result_queue.put(("callback", task.error_callback, ("Task cancelled",)))
+                        continue
+                    
+                    # 执行任务
+                    self._execute_task(task)
+                    
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"Worker loop error: {e}")
+                    traceback.print_exc()
+        
+        finally:
+            # 清理资源
+            if self.tts_executor:
+                self.tts_executor.shutdown(wait=True)
+            if self.event_loop and not self.event_loop.is_closed():
+                self.event_loop.close()
+    
+    def _execute_task(self, task: Task):
+        """执行单个任务"""
+        try:
+            # 检查函数是否是协程
+            if asyncio.iscoroutinefunction(task.func):
+                # 异步函数：在事件循环中执行
+                result = self.event_loop.run_until_complete(
+                    task.func(*task.args, **task.kwargs)
+                )
+            else:
+                # 同步函数：直接执行
+                result = task.func(*task.args, **task.kwargs)
+            
+            # 任务成功，发送回调
+            if task.callback:
+                self.result_queue.put(("callback", task.callback, (result,)))
+            
+            self._cleanup_task(task.task_id, cancelled=False)
+            
+        except Exception as e:
+            # 任务失败，发送错误回调
+            print(f"Task {task.task_id} failed: {e}")
+            traceback.print_exc()
+            
+            if task.error_callback:
+                self.result_queue.put(("callback", task.error_callback, (e,)))
+            
+            self._cleanup_task(task.task_id, cancelled=False)
+    
+    def _cleanup_task(self, task_id: str, cancelled: bool):
+        """清理任务"""
+        with self.task_lock:
+            self.active_tasks.pop(task_id, None)
+            if cancelled:
+                self.cancelled_tasks.discard(task_id)
+
 
 # ===== 配置选项 =====
 class AppConfig:
@@ -45,6 +240,7 @@ class AppConfig:
     
     # TTS配置
     DEFAULT_VOICE = "zh-CN-YunjianNeural"  # edge-tts 默认语音
+    DEFAULT_TTS_ENGINE = "edge-tts"  # 默认TTS引擎
     MAX_RETRIES = 3  # TTS最大重试次数
     RETRY_DELAY_SECONDS = 5  # TTS重试间隔（秒）
     CHARS_PER_SECOND = 0.3  # 估算每个字的朗读时间（秒）
@@ -237,7 +433,15 @@ class EpubReader:
 
             # 方法1: 通过meta标签寻找cover ID
             root = None
-            opf_path = self.opf_dir + "content.opf" if self.opf_dir else "content.opf"
+            # 智能查找 content.opf 文件
+            opf_path = None
+            if self.opf_dir:
+                opf_path = self.opf_dir + "content.opf"
+            else:
+                # 如果没有目录，尝试直接查找
+                opf_path = "content.opf"
+            
+            # 尝试读取 opf 文件
             try:
                 content_opf = self.epub_zip.read(opf_path)
                 root = ET.fromstring(content_opf)
@@ -318,7 +522,27 @@ class EpubReader:
                         return self.epub_zip.read(name)
 
             except KeyError:
-                print(f"Warning: content.opf not found at {opf_path}")
+                # content.opf 不在预期位置，尝试查找
+                found_opf = None
+                for name in self.epub_zip.namelist():
+                    if name.lower().endswith('.opf'):  # 查找任何 .opf 文件
+                        found_opf = name
+                        break
+                
+                if found_opf:
+                    # 找到了，使用正确的路径重试
+                    try:
+                        content_opf = self.epub_zip.read(found_opf)
+                        root = ET.fromstring(content_opf)
+                        # 更新 opf_dir 以供后续使用
+                        self.opf_dir = os.path.dirname(found_opf)
+                        if self.opf_dir and not self.opf_dir.endswith('/'):
+                            self.opf_dir += '/'
+                        # 成功找到并读取，继续处理封面逻辑
+                        # (注意：这里需要重复上面的封面查找逻辑)
+                    except Exception:
+                        pass  # 静默失败，ebooklib 已经成功读取了书籍
+                # 如果找不到也不显示警告，因为 ebooklib 已经成功读取了书籍内容
             except Exception as e:
                 print(f"获取封面数据（fallback）时出错: {e}")
                 traceback.print_exc()
@@ -651,46 +875,338 @@ def generate_simple_lrc(text, chars_per_line):
     return '\n'.join(lrc_lines)
 
 
-async def process_text_to_mp3(text, output_audio, output_lrc, voice, chars_per_line=DEFAULT_CHARS_PER_LINE,
-                              max_retries=MAX_RETRIES):
-    """根据文本内容生成MP3和LRC文件"""
-    for attempt in range(max_retries):
-        try:
-            if not text or not text.strip():
-                print(f"警告：文本为空，无法生成音频。", file=sys.stderr)
-                return False
+# ===== TTS引擎抽象层 =====
+class TTSEngine:
+    """基础TTS引擎抽象类"""
+    
+    @staticmethod
+    async def generate_audio(text, output_audio, voice, **kwargs):
+        """
+        生成音频文件
+        
+        Args:
+            text: 要转换的文本
+            output_audio: 输出MP3文件路径
+            voice: 语音名称
+            **kwargs: 其他参数
+        
+        Returns:
+            tuple: (success: bool, srt_content: str or None)
+        """
+        raise NotImplementedError()
+    
+    @staticmethod
+    def get_available_voices():
+        """获取可用语音列表"""
+        raise NotImplementedError()
 
+
+class EdgeTTSEngine(TTSEngine):
+    """Microsoft Edge TTS引擎"""
+    
+    @staticmethod
+    async def generate_audio(text, output_audio, voice, **kwargs):
+        """Edge-TTS生成音频"""
+        try:
             communicate = edge_tts.Communicate(text, voice)
             submaker = edge_tts.SubMaker()
             os.makedirs(os.path.dirname(output_audio), exist_ok=True)
-
+            
             with open(output_audio, "wb") as audio_file:
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
                         audio_file.write(chunk["data"])
                     elif chunk["type"] == "WordBoundary":
                         submaker.feed(chunk)
-
-            srt_content = submaker.get_srt()
             
-            # 检查SRT内容是否为空
-            if not srt_content or not srt_content.strip():
-                print(f"警告：edge-tts未返回字幕数据，使用降级方案生成简单LRC", file=sys.stderr)
-                # 降级方案：生成简单的LRC文件（智能断句）
-                lrc_content = generate_simple_lrc(text, chars_per_line)
-            else:
+            srt_content = submaker.get_srt()
+            return True, srt_content
+        except Exception as e:
+            print(f"Edge-TTS生成失败: {e}", file=sys.stderr)
+            return False, None
+    
+    @staticmethod
+    def get_available_voices():
+        """获取Edge-TTS可用语音"""
+        return [
+            ("zh-CN-YunjianNeural", "云健 (男声)"),
+            ("zh-CN-XiaoxiaoNeural", "晓晓 (女声)"),
+            ("zh-CN-YunxiNeural", "云希 (男童声)"),
+            ("zh-CN-XiaoyiNeural", "晓伊 (女声)"),
+            ("zh-CN-YunyangNeural", "云扬 (男声)"),
+            ("zh-CN-liaoning-XiaobeiNeural", "晓北 (女声,辽宁口音)"),
+            ("en-US-BrianMultilingualNeural", "Brian (英文,多语言)"),
+            ("en-US-AndrewMultilingualNeural", "Andrew (英文,多语言)"),
+            ("en-US-EmmaMultilingualNeural", "Emma (英文,多语言)"),
+        ]
+
+
+class GoogleTTSEngine(TTSEngine):
+    """Google TTS引擎 (gTTS)"""
+    
+    @staticmethod
+    async def generate_audio(text, output_audio, voice, **kwargs):
+        """gTTS生成音频"""
+        try:
+            from gtts import gTTS
+        except ImportError as e:
+            error_msg = "gTTS未安装，请运行: pip install gtts"
+            print(error_msg, file=sys.stderr)
+            raise ImportError(error_msg) from e
+        
+        try:
+            # gTTS使用语言代码，不是语音名
+            # voice参数格式: "zh-CN" 或 "en"
+            lang = voice if voice else "zh-CN"
+            
+            os.makedirs(os.path.dirname(output_audio), exist_ok=True)
+            
+            # gTTS是同步的，在异步环境中运行
+            def _generate_with_gtts():
+                """生成gTTS音频，强制禁用代理"""
+                import os as os_module
+                import requests
+                from unittest.mock import patch
+                
+                # 保存原始代理设置
+                saved_proxies = {}
+                proxy_keys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 
+                             'NO_PROXY', 'no_proxy', 'ALL_PROXY', 'all_proxy']
+                for key in proxy_keys:
+                    if key in os_module.environ:
+                        saved_proxies[key] = os_module.environ[key]
+                
+                try:
+                    # 清除所有代理设置
+                    for key in proxy_keys:
+                        os_module.environ.pop(key, None)
+                    
+                    # 使用 monkey patch 强制禁用 requests 的代理
+                    original_merge_environment_settings = requests.Session.merge_environment_settings
+                    
+                    def no_proxy_merge_environment_settings(self, url, proxies, stream, verify, cert):
+                        # 调用原始方法，但强制 proxies 为空
+                        return original_merge_environment_settings(self, url, {}, stream, verify, cert)
+                    
+                    requests.Session.merge_environment_settings = no_proxy_merge_environment_settings
+                    
+                    try:
+                        # 创建gTTS对象并生成音频
+                        tts = gTTS(text=text, lang=lang, slow=False)
+                        tts.save(output_audio)
+                    finally:
+                        # 恢复原始方法
+                        requests.Session.merge_environment_settings = original_merge_environment_settings
+                    
+                finally:
+                    # 恢复代理设置
+                    for key, value in saved_proxies.items():
+                        os_module.environ[key] = value
+            
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                _generate_with_gtts
+            )
+            
+            return True, None  # gTTS不提供字幕
+        except Exception as e:
+            error_str = str(e)
+            print(f"gTTS生成失败: {error_str}", file=sys.stderr)
+            
+            # 检查是否是网络连接问题
+            if any(keyword in error_str for keyword in [
+                "Failed to connect", "ConnectionError", "TimeoutError", 
+                "10060", "Max retries exceeded", "NewConnectionError", "ProxyError"
+            ]):
+                # 检查是否是代理问题
+                if "ProxyError" in error_str or "Cannot connect to proxy" in error_str:
+                    raise Exception(
+                        "gTTS代理连接失败\n"
+                        "原因：系统配置了代理但代理服务器不可用\n\n"
+                        "建议解决方案：\n"
+                        "1. 切换为 edge-tts（推荐，微软服务，国内可用）\n"
+                        "2. 关闭系统代理设置后再试\n"
+                        "3. 或切换为 pyttsx3（离线使用，需要FFmpeg）"
+                    )
+                else:
+                    raise Exception(
+                        "gTTS无法连接到 Google 服务\n"
+                        "原因：在中国大陆无法直接访问 Google 服务\n\n"
+                        "建议解决方案：\n"
+                        "1. 切换为 edge-tts（推荐，微软服务，国内可用）\n"
+                        "2. 切换为 pyttsx3（离线使用，需要FFmpeg）\n"
+                        "3. 或启用VPN/代理后再使用 gTTS"
+                    )
+            raise
+    
+    @staticmethod
+    def get_available_voices():
+        """获取gTTS可用语言"""
+        return [
+            ("zh-CN", "中文 (简体)"),
+            ("zh-TW", "中文 (繁体)"),
+            ("en", "English"),
+            ("ja", "日本語"),
+            ("ko", "한국어"),
+            ("fr", "Français"),
+            ("de", "Deutsch"),
+            ("es", "Español"),
+        ]
+
+
+class Pyttsx3Engine(TTSEngine):
+    """离线TTS引擎 (pyttsx3)。注意：需要FFmpeg转换WAV为MP3"""
+    
+    @staticmethod
+    async def generate_audio(text, output_audio, voice, **kwargs):
+        """pyttsx3生成音频"""
+        try:
+            import pyttsx3
+        except ImportError as e:
+            error_msg = "pyttsx3未安装，请运行: pip install pyttsx3"
+            print(error_msg, file=sys.stderr)
+            raise ImportError(error_msg) from e
+        
+        try:
+            os.makedirs(os.path.dirname(output_audio), exist_ok=True)
+            
+            # 获取FFmpeg路径
+            ffmpeg_path = kwargs.get('ffmpeg_path')
+            if not ffmpeg_path:
+                # 尝试检测系统中的FFmpeg
+                is_installed, detected_path = check_ffmpeg_installed()
+                if is_installed:
+                    ffmpeg_path = detected_path
+                else:
+                    raise Exception(
+                        "pyttsx3需要FFmpeg才能转换为MP3格式\n"
+                        "请在[设置与自定义]标签页安装FFmpeg\n"
+                        "或切换使用 edge-tts / gTTS 引擎"
+                    )
+            
+            # pyttsx3是同步的
+            def _generate():
+                engine = pyttsx3.init()
+                
+                # 设置语音（如果指定）
+                if voice and voice != "default":
+                    voices = engine.getProperty('voices')
+                    for v in voices:
+                        if voice in v.id or voice in v.name:
+                            engine.setProperty('voice', v.id)
+                            break
+                
+                # 设置语速
+                rate = kwargs.get('rate', 150)
+                engine.setProperty('rate', rate)
+                
+                # 保存为WAV，然后转换为MP3
+                temp_wav = output_audio.replace('.mp3', '.wav')
+                engine.save_to_file(text, temp_wav)
+                engine.runAndWait()
+                
+                # 转换WAV为MP3（需要ffmpeg）
+                if os.path.exists(temp_wav):
+                    import subprocess
+                    try:
+                        result = subprocess.run([
+                            ffmpeg_path, '-i', temp_wav, '-codec:a', 'libmp3lame',
+                            '-b:a', '192k', '-y', output_audio
+                        ], check=True, capture_output=True, timeout=30)
+                        os.remove(temp_wav)
+                        return True
+                    except subprocess.CalledProcessError as e:
+                        # FFmpeg执行失败
+                        error_output = e.stderr.decode('utf-8', errors='ignore') if e.stderr else ''
+                        raise Exception(f"FFmpeg转换失败: {error_output}")
+                    except subprocess.TimeoutExpired:
+                        raise Exception("FFmpeg转换超时")
+                else:
+                    raise Exception("pyttsx3生成WAV文件失败")
+            
+            result = await asyncio.get_event_loop().run_in_executor(None, _generate)
+            return result, None  # pyttsx3不提供字幕
+        except FileNotFoundError as e:
+            # FFmpeg未找到
+            error_msg = (
+                "pyttsx3需要FFmpeg才能转换为MP3格式\n"
+                "请在[设置与自定义]标签页安装FFmpeg\n"
+                "或切换使用 edge-tts / gTTS 引擎"
+            )
+            print(f"pyttsx3错误: {error_msg}", file=sys.stderr)
+            raise Exception(error_msg) from e
+        except Exception as e:
+            print(f"pyttsx3生成失败: {e}", file=sys.stderr)
+            raise
+    
+    @staticmethod
+    def get_available_voices():
+        """获取pyttsx3可用语音"""
+        try:
+            import pyttsx3
+            engine = pyttsx3.init()
+            voices = engine.getProperty('voices')
+            return [("default", "系统默认")] + [(v.id, v.name) for v in voices]
+        except:
+            return [("default", "系统默认")]
+
+
+# TTS引擎注册表
+TTS_ENGINES = {
+    "edge-tts": EdgeTTSEngine,
+    "gtts": GoogleTTSEngine,
+    "pyttsx3": Pyttsx3Engine,
+}
+
+
+def get_tts_engine(engine_name):
+    """获取TTS引擎实例"""
+    return TTS_ENGINES.get(engine_name, EdgeTTSEngine)
+
+
+async def process_text_to_mp3(text, output_audio, output_lrc, voice, chars_per_line=DEFAULT_CHARS_PER_LINE,
+                              max_retries=MAX_RETRIES, tts_engine="edge-tts", **kwargs):
+    """根据文本内容生成MP3和LRC文件"""
+    # 获取TTS引擎
+    engine = get_tts_engine(tts_engine)
+    
+    for attempt in range(max_retries):
+        try:
+            if not text or not text.strip():
+                print(f"警告：文本为空，无法生成音频。", file=sys.stderr)
+                return False
+
+            # 使用指定的TTS引擎生成音频
+            success, srt_content = await engine.generate_audio(text, output_audio, voice, **kwargs)
+            
+            if not success:
+                if attempt < max_retries - 1:
+                    print(f"生成音频失败 (第 {attempt + 1}/{max_retries} 次尝试)", file=sys.stderr)
+                    print(f"等待 {RETRY_DELAY_SECONDS} 秒后自动重试...", file=sys.stderr)
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
+                    continue
+                else:
+                    print(f"生成音频失败，已达到最大重试次数 ({max_retries})", file=sys.stderr)
+                    return False
+            
+            # 生成LRC文件
+            if srt_content and srt_content.strip():
+                # 有SRT字幕数据，转换为LRC
                 lrc_content = convert_srt_to_lrc(srt_content, chars_per_line)
                 
                 # 再次检查转换后的LRC是否为空
                 if not lrc_content or not lrc_content.strip():
-                    print(f"警告：SRT转LRC失败，使用降级方案", file=sys.stderr)
-                    # 使用智能断句的降级方案
+                    # 使用降级方案
                     lrc_content = generate_simple_lrc(text, chars_per_line)
+            else:
+                # 没有SRT数据，使用降级方案
+                lrc_content = generate_simple_lrc(text, chars_per_line)
 
             with open(output_lrc, "w", encoding="utf-8") as lrc_file:
                 lrc_file.write(lrc_content)
 
             return True
+            
         except aiohttp.ClientError as e:
             if attempt < max_retries - 1:
                 print(f"网络连接错误 (第 {attempt + 1}/{max_retries} 次尝试)：{e}", file=sys.stderr)
@@ -969,8 +1485,15 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 }
                 
+                # 设置代理（仅HTTP，避免 HTTPS 代理警告）
+                proxies = None
+                # 尝试从环境变量获取代理
+                http_proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+                if http_proxy:
+                    proxies = {'http': http_proxy, 'https': http_proxy}
+                
                 # 开始下载
-                response = requests.get(download_url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT)
+                response = requests.get(download_url, headers=headers, proxies=proxies, stream=True, timeout=DOWNLOAD_TIMEOUT, verify=False)
                 response.raise_for_status()
                 
                 total_size = int(response.headers.get('content-length', 0))
@@ -1373,8 +1896,12 @@ class EpubToMp3App:
         # 创建临时目录
         os.makedirs(TEMP_DIR, exist_ok=True)
 
-        # 创建通信队列
+        # 创建通信队列（仍然用于GUI更新）
         self.message_queue = queue.Queue()
+        
+        # *** 创建统一的任务调度器 ***
+        self.task_scheduler = TaskScheduler(max_concurrent_tts=3)
+        self.task_scheduler.start()
 
         # 创建基本字体
         self.base_font = font.Font(family='Microsoft YaHei', size=11)
@@ -1644,81 +2171,133 @@ class EpubToMp3App:
         tts_frame = ttk.LabelFrame(mp3_main_frame, text="TTS配置", padding=5)
         tts_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(tts_frame, text="语音:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.voice_var = tk.StringVar(value=DEFAULT_VOICE)
-        voice_combo = ttk.Combobox(tts_frame, textvariable=self.voice_var, width=30)
-        voice_combo['values'] = [
-            "zh-CN-YunjianNeural",  # 男声
-            "zh-CN-XiaoxiaoNeural",  # 女声
-            "zh-CN-YunxiNeural",  # 男童声
-            "zh-CN-XiaoyiNeural",  # 女声
-            "zh-CN-YunyangNeural",  # 男声
-            "zh-CN-liaoning-XiaobeiNeural",  # 女声，辽宁口音
-            "en-US-BrianMultilingualNeural",  # 英文
-            "en-US-BrianNeural",
-            "en-US-AndrewMultilingualNeural",
-            "en-US-AndrewNeural",
-            "en-US-EmmaMultilingualNeural",
-            "en-US-EmmaNeural",
+        # TTS引擎选择
+        ttk.Label(tts_frame, text="TTS引擎:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.tts_engine_var = tk.StringVar(value=AppConfig.DEFAULT_TTS_ENGINE)
+        tts_engine_combo = ttk.Combobox(tts_frame, textvariable=self.tts_engine_var, width=15, state="readonly")
+        tts_engine_combo['values'] = [
+            "edge-tts",
+            "gtts",
+            "pyttsx3",
         ]
-        voice_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        tts_engine_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        tts_engine_combo.bind('<<ComboboxSelected>>', self.on_tts_engine_changed)
+
+        ttk.Label(tts_frame, text="语音:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.voice_var = tk.StringVar(value=DEFAULT_VOICE)
+        self.voice_combo = ttk.Combobox(tts_frame, textvariable=self.voice_var, width=30)
+        self.voice_combo.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        
+        # 初始化语音列表
+        self.update_voice_list()
 
         # ====== 新增试听按钮（用pygame播放）======
         def tts_preview():
             if self.processing:
                 messagebox.showwarning("处理中", "有转换任务正在进行，请等待完成。")
                 return
+            
             text = "腹有诗书气自华，读书万卷始通神"
-            voice = self.voice_var.get()
+            voice = self.get_selected_voice_code()  # 提取语音代码
+            tts_engine = self.tts_engine_var.get()  # 获取TTS引擎
             self.update_status("正在生成试听音频...")
+            self.append_log(f"试听TTS引擎: {tts_engine}")
             self.append_log(f"试听语音: {voice}")
+            
             # 为试听创建独立的临时文件
             preview_mp3 = tempfile.mktemp(suffix='.mp3', prefix='epubReader_preview_')
-            try:
-                import asyncio
-                async def gen_preview():
-                    communicate = edge_tts.Communicate(text, voice)
-                    with open(preview_mp3, "wb") as f:
-                        async for chunk in communicate.stream():
-                            if chunk["type"] == "audio":
-                                f.write(chunk["data"])
-
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(gen_preview())
-            except Exception as e:
-                self.update_status(f"试听生成失败: {e}")
-                messagebox.showerror("试听失败", f"试听音频生成失败: {e}")
-                return
-
-            try:
-                import pygame
-            except ImportError:
-                messagebox.showerror("缺少依赖", "需要安装 pygame 库才能试听音频。\n请运行：pip install pygame")
-                return
-
-            if not os.path.exists(preview_mp3):
-                messagebox.showerror("试听失败", "试听音频文件未生成")
-                return
-
-            def play_with_pygame():
+            
+            # *** 使用任务调度器执行 TTS 预览 ***
+            async def generate_preview_audio():
+                """生成预览音频（使用选中的TTS引擎）"""
                 try:
-                    pygame.init()
-                    pygame.mixer.init()
-                    pygame.mixer.music.load(preview_mp3)
-                    pygame.mixer.music.play()
-                    self.update_status("试听播放中...")
-                    while pygame.mixer.music.get_busy():
-                        pygame.time.wait(100)
-                    pygame.mixer.music.stop()
+                    engine = get_tts_engine(tts_engine)
+                    success, _ = await engine.generate_audio(text, preview_mp3, voice)
+                    if success:
+                        return preview_mp3
+                    else:
+                        raise Exception(f"{tts_engine} 生成音频失败")
+                except ImportError as e:
+                    # 依赖未安装
+                    raise ImportError(str(e))
                 except Exception as e:
-                    messagebox.showerror("试听失败", f"音频播放失败: {e}")
-                finally:
-                    pygame.quit()
-                    self.update_status("试听结束")
-
-            import threading
-            threading.Thread(target=play_with_pygame, daemon=True).start()
+                    # 其他错误
+                    raise Exception(f"{tts_engine} 错误: {str(e)}")
+            
+            def on_preview_success(mp3_path):
+                """预览生成成功，播放音频"""
+                if not os.path.exists(mp3_path):
+                    messagebox.showerror("试听失败", "试听音频文件未生成")
+                    return
+                
+                try:
+                    import pygame
+                except ImportError:
+                    messagebox.showerror("缺少依赖", "需要安装 pygame 库才能试听音频。\n请运行：pip install pygame")
+                    return
+                
+                def play_with_pygame():
+                    try:
+                        pygame.init()
+                        pygame.mixer.init()
+                        pygame.mixer.music.load(mp3_path)
+                        pygame.mixer.music.play()
+                        self.update_status("试听播放中...")
+                        while pygame.mixer.music.get_busy():
+                            pygame.time.wait(100)
+                        pygame.mixer.music.stop()
+                    except Exception as e:
+                        messagebox.showerror("试听失败", f"音频播放失败: {e}")
+                    finally:
+                        pygame.quit()
+                        self.update_status("试听结束")
+                        # 清理临时文件
+                        try:
+                            if os.path.exists(mp3_path):
+                                os.remove(mp3_path)
+                        except:
+                            pass
+                
+                # 在新线程中播放（避免阻塞GUI）
+                threading.Thread(target=play_with_pygame, daemon=True).start()
+            
+            def on_preview_error(error):
+                """预览生成失败"""
+                error_str = str(error)
+                self.update_status(f"试听失败: {error_str}")
+                
+                # 检查是否是依赖未安装
+                if "未安装" in error_str or "pip install" in error_str:
+                    messagebox.showerror(
+                        "缺少依赖", 
+                        f"{error_str}\n\n请在命令行中安装该库后重试。"
+                    )
+                # 检查是否是gTTS网络问题
+                elif "gTTS" in error_str and ("无法连接" in error_str or "Google" in error_str):
+                    messagebox.showerror(
+                        "gTTS 无法使用",
+                        f"gTTS 在中国大陆无法使用（Google 服务被屏蔽）\n\n"
+                        f"强烈建议您立即切换为 edge-tts！\n\n"
+                        f"操作步骤：\n"
+                        f"1. 在上方 'TTS引擎' 下拉框选择 'edge-tts'\n"
+                        f"2. 再次点击 '试听' 按钮\n\n"
+                        f"edge-tts 优势：\n"
+                        f"• 国内稳定可用（微软服务）\n"
+                        f"• 高质量音频，多种中文语音\n"
+                        f"• 支持精确的字幕时间轴\n\n"
+                        f"错误详情：{error_str}"
+                    )
+                else:
+                    messagebox.showerror("试听失败", f"试听音频生成失败:\n{error_str}")
+            
+            task = Task(
+                task_id=str(uuid.uuid4()),
+                task_type=TaskType.TTS,
+                func=generate_preview_audio,
+                callback=on_preview_success,
+                error_callback=on_preview_error
+            )
+            self.task_scheduler.submit_task(task)
 
         # ====== 试听按钮结束 ======
         preview_btn = ttk.Button(tts_frame, text="试听", command=tts_preview)
@@ -1869,6 +2448,34 @@ class EpubToMp3App:
         )
         if file_path:
             self.cover_path_var.set(file_path)
+    
+    def on_tts_engine_changed(self, event=None):
+        """当TTS引擎变化时更新语音列表"""
+        self.update_voice_list()
+    
+    def update_voice_list(self):
+        """根据TTS引擎更新语音列表"""
+        engine_name = self.tts_engine_var.get()
+        engine = get_tts_engine(engine_name)
+        
+        # 获取可用语音
+        voices = engine.get_available_voices()
+        
+        # 格式化为显示列表
+        voice_display = [f"{code} - {name}" for code, name in voices]
+        self.voice_combo['values'] = voice_display
+        
+        # 设置默认值
+        if voices:
+            default_voice = f"{voices[0][0]} - {voices[0][1]}"
+            self.voice_var.set(default_voice)
+    
+    def get_selected_voice_code(self):
+        """从选中的语音显示中提取语音代码"""
+        voice_str = self.voice_var.get()
+        if " - " in voice_str:
+            return voice_str.split(" - ")[0]
+        return voice_str
 
     def select_epub_file(self):
         """选择EPUB文件并解析"""
@@ -1890,30 +2497,39 @@ class EpubToMp3App:
         # 清空显示
         self.clear_display()
 
-        # 在后台线程中解析EPUB
-        threading.Thread(target=self._parse_epub_in_thread, args=(file_path,), daemon=True).start()
-
-    def _parse_epub_in_thread(self, file_path):
-        """在后台线程中解析EPUB文件"""
-        try:
-            self.epub_data = parse_epub_data(file_path)
-
-            # 使用队列将结果传递回主线程
-            if self.epub_data:
-                self.message_queue.put(("display_epub", None))
-                self.message_queue.put(("status", f"已加载 {os.path.basename(file_path)}"))
-            else:
-                self.message_queue.put(("status", f"解析失败: {os.path.basename(file_path)}"))
-                self.message_queue.put(("error", "无法解析选定的EPUB文件。"))
-
-        except Exception as e:
-            self.message_queue.put(("status", f"解析出错: {str(e)}"))
-            self.message_queue.put(("error", f"解析EPUB文件时发生错误: {str(e)}"))
-            traceback.print_exc()
+        # *** 使用任务调度器解析EPUB ***
+        task_id = str(uuid.uuid4())
+        task = Task(
+            task_id=task_id,
+            task_type=TaskType.PARSE_EPUB,
+            func=parse_epub_data,
+            args=(file_path,),
+            callback=lambda result: self._on_epub_parsed(result, file_path),
+            error_callback=lambda error: self._on_epub_parse_error(error, file_path)
+        )
+        self.task_scheduler.submit_task(task)
+    
+    def _on_epub_parsed(self, epub_data, file_path):
+        """解析成功回调"""
+        self.epub_data = epub_data
+        if self.epub_data:
+            self.message_queue.put(("display_epub", None))
+            self.message_queue.put(("status", f"已加载 {os.path.basename(file_path)}"))
+        else:
+            self.message_queue.put(("status", f"解析失败: {os.path.basename(file_path)}"))
+            self.message_queue.put(("error", "无法解析选定的EPUB文件。"))
+    
+    def _on_epub_parse_error(self, error, file_path):
+        """解析失败回调"""
+        error_msg = str(error)
+        self.message_queue.put(("status", f"解析出错: {error_msg}"))
+        self.message_queue.put(("error", f"解析EPUB文件时发生错误: {error_msg}"))
+        traceback.print_exc()
 
     def process_messages(self):
         """处理消息队列的消息，更新UI"""
         try:
+            # 处理GUI消息队列
             while not self.message_queue.empty():
                 message_type, data = self.message_queue.get_nowait()
 
@@ -1941,6 +2557,18 @@ class EpubToMp3App:
                 elif message_type == "clear_failed_chapters":
                     # 清空失败章节列表
                     self.failed_chapters.clear()
+            
+            # *** 处理任务调度器的回调 ***
+            result = self.task_scheduler.get_result()
+            while result:
+                result_type, callback, args = result
+                if result_type == "callback" and callback:
+                    try:
+                        callback(*args)
+                    except Exception as e:
+                        print(f"Callback error: {e}")
+                        traceback.print_exc()
+                result = self.task_scheduler.get_result()
 
         except queue.Empty:
             pass
@@ -2359,7 +2987,8 @@ class EpubToMp3App:
             "content": content,
             "output_mp3": output_mp3,
             "output_lrc": output_lrc,
-            "voice": self.voice_var.get(),
+            "voice": self.get_selected_voice_code(),  # 提取语音代码
+            "tts_engine": self.tts_engine_var.get(),  # 添加TTS引擎
             "chars_per_line": self.chars_per_line_var.get(),
             "artist": self.artist_var.get(),
             "album": self.album_var.get(),
@@ -2402,14 +3031,15 @@ class EpubToMp3App:
 
             self.message_queue.put(("log", "正在生成MP3..."))
 
-            # 执行TTS转换
+            # 执行TTS转换（使用指定的TTS引擎）
             result = loop.run_until_complete(
                 process_text_to_mp3(
                     params['content'],
                     params['output_mp3'],
                     params['output_lrc'],
                     params['voice'],
-                    params['chars_per_line']
+                    params['chars_per_line'],
+                    tts_engine=params.get('tts_engine', 'edge-tts')
                 )
             )
 
@@ -2559,8 +3189,14 @@ class EpubToMp3App:
         def check_cancel():
             return cancel_flag['cancelled']
         
-        def install_thread():
-            success, ffmpeg_path, error_msg = download_ffmpeg(update_progress, check_cancel)
+        # *** 使用任务调度器下载FFmpeg ***
+        def download_task_wrapper():
+            """包装下载任务（同步函数）"""
+            return download_ffmpeg(update_progress, check_cancel)
+        
+        def on_download_success(result):
+            """下载成功回调"""
+            success, ffmpeg_path, error_msg = result
             
             # 关闭进度对话框
             try:
@@ -2591,7 +3227,25 @@ class EpubToMp3App:
                     "- 或手动下载安装FFmpeg"
                 )
         
-        threading.Thread(target=install_thread, daemon=True).start()
+        def on_download_error(error):
+            """下载失败回调"""
+            try:
+                progress_dialog.destroy()
+            except:
+                pass
+            
+            if not cancel_flag['cancelled']:
+                messagebox.showerror("安装错误", f"FFmpeg安装过程中出错: {str(error)}")
+        
+        task = Task(
+            task_id=str(uuid.uuid4()),
+            task_type=TaskType.DOWNLOAD,
+            func=download_task_wrapper,
+            callback=on_download_success,
+            error_callback=on_download_error,
+            cancellable=True
+        )
+        self.task_scheduler.submit_task(task)
     
     def install_ffmpeg_from_local(self):
         """从本地ZIP文件安装FFmpeg"""
@@ -2640,8 +3294,14 @@ class EpubToMp3App:
             except tk.TclError:
                 pass
         
-        def install_thread():
-            success, ffmpeg_path, error_msg = install_ffmpeg_from_zip(zip_file, update_progress)
+        # *** 使用任务调度器安装FFmpeg ***
+        def install_task_wrapper():
+            """包装安装任务（同步函数）"""
+            return install_ffmpeg_from_zip(zip_file, update_progress)
+        
+        def on_install_success(result):
+            """安装成功回调"""
+            success, ffmpeg_path, error_msg = result
             
             # 关闭进度对话框
             try:
@@ -2664,7 +3324,23 @@ class EpubToMp3App:
                     "请确保选择的是有效的FFmpeg ZIP文件。"
                 )
         
-        threading.Thread(target=install_thread, daemon=True).start()
+        def on_install_error(error):
+            """安装失败回调"""
+            try:
+                progress_dialog.destroy()
+            except:
+                pass
+            
+            messagebox.showerror("安装错误", f"FFmpeg安装过程中出错: {str(error)}")
+        
+        task = Task(
+            task_id=str(uuid.uuid4()),
+            task_type=TaskType.GENERAL,
+            func=install_task_wrapper,
+            callback=on_install_success,
+            error_callback=on_install_error
+        )
+        self.task_scheduler.submit_task(task)
     
     def merge_mp3_to_m4b_dialog(self):
         """显示MP3合并为M4B的对话框"""
@@ -3200,9 +3876,16 @@ class EpubToMp3App:
         completed_count = 0
         lock = th.Lock()  # 线程锁保护共享资源
         
-        # 创建单一的事件循环用于所有异步任务（在专用线程中复用）
+        # 创建单一的事件循环用于所有异步任务（在专用线程中运行）
         event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(event_loop)
+        
+        # 在单独的线程中运行事件循环
+        def run_event_loop():
+            asyncio.set_event_loop(event_loop)
+            event_loop.run_forever()
+        
+        loop_thread = th.Thread(target=run_event_loop, daemon=True, name="AsyncIO-Loop")
+        loop_thread.start()
         
         def process_single_chapter(index, chapter):
             """处理单个章节（复用事件循环）"""
@@ -3487,6 +4170,11 @@ class EpubToMp3App:
             traceback.print_exc()
             self.root.after(0, lambda: messagebox.showerror("批量生成错误", str(e)))
         finally:
+            # 停止事件循环
+            event_loop.call_soon_threadsafe(event_loop.stop)
+            loop_thread.join(timeout=2.0)
+            event_loop.close()
+            
             self.processing = False
             self.root.after(0, lambda: self.generate_ebook_button.config(state="normal"))
 
@@ -3760,6 +4448,9 @@ class EpubToMp3App:
         if not messagebox.askyesno("确认退出", msg):
             return
 
+        # *** 停止任务调度器 ***
+        self.task_scheduler.stop()
+        
         # 清理临时文件夹
         try:
             if os.path.exists(TEMP_DIR):
