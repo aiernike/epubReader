@@ -3,6 +3,21 @@
 把 EPUB / TXT 电子书转成有声书：调用微软 Edge 在线语音逐章合成 MP3，同时生成 LRC 字幕，
 最后用 FFmpeg 合成带章节标记的 M4B。Windows 桌面程序，Tkinter 单文件实现，可打包成免安装 exe。
 
+## 下载
+
+不想装 Python 的话，直接下免安装单文件版：
+
+| 版本 | 文件 | 说明 |
+| --- | --- | --- |
+| [v0.04](https://github.com/aiernike/epubReader/releases/download/v0.04/epub.reader.v0.04.exe) | `epub.reader.v0.04.exe` | **推荐**。内置 edge-tts 7.3.1，修复"转换失败（403）"与关闭时报错。约 22 MB |
+| [v0.01](https://github.com/aiernike/epubReader/releases/tag/v0.01) | `epub.reader.exe` | 旧版，**内置的 edge-tts 已被微软拒绝，转换会失败**，仅作留档 |
+
+双击即可运行，不需要安装。首次启动会慢两三秒（单文件版要先把自身解压到临时目录，属正常）。
+
+**FFmpeg** 不在安装包里（会让体积翻十倍）：程序按
+**随包目录 → `%APPDATA%\epubReader\ffmpeg\bin` → 系统 PATH** 顺序查找，
+都没有时界面会提示一键联网下载。
+
 ## 界面
 
 | 空状态 | 载入 EPUB 后 |
