@@ -1,50 +1,68 @@
-# Python
+# ---------- Python ----------
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual Environment
+.venv/
 venv/
-ENV/
-env/
-.venv
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+# ---------- 打包产物（体积大、可重建） ----------
+build/
+build_onefile/
+dist/
+dist_onefile/
+*.spec.bak
 
-# Project Specific
-有声书目录*/
-*.mp3
-*.m4b
-*.lrc
-temp_*/
-ffmpeg_extract/
+# ---------- 随包/下载的 ffmpeg（约 190MB 起，不入库） ----------
+ffmpeg_essentials/
+ffmpeg_local/
+ffmpeg*.zip
+*.exe
 
-# Logs
+# ---------- 运行与测试产物 ----------
+_smoke_run/
+_onefile_run/
+_upgrade_backup/
 *.log
+*.err
+build_log.txt
 
-# Test Files
-test_*.py
-tests/
+# ---------- 备份/快照 ----------
+*.bak
+*.bak-*
+epub reader.fixed.py
+epub reader.orig-*.py
+
+# ---------- 一次性补丁脚本 ----------
+# 这些都是"对单文件源码就地打补丁"的脚本，产物已经并入 epubReader.py，
+# 留在本地备查，但不属于可复现的工程内容。
+action_bar.py
+apply_edit.py
+bundled_ffmpeg.py
+compact.py
+edge_hint.py
+fix_format.py
+hint_fix.py
+hook_hint.py
+io_retry.py
+layout_fix.py
+layout_fix2.py
+layout_fix4.py
+log_drawer.py
+measure_ui.py
+polish.py
+shot_ui.py
+slim_ffmpeg.py
+
+# ---------- 已被 verify_exe_launch.py 取代的旧验证脚本 ----------
+verify_exe.py
+verify_exe_close.py
+verify_exe_workspace.py
+verify_source_close.py
+
+# ---------- 系统/编辑器 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
+.idea/
+.vscode/

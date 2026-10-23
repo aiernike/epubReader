@@ -8,6 +8,11 @@ epubReader - EPUB电子书阅读器和有声书生成工具
 4. 支持M4B有声书格式导出，包含完整章节信息
 """
 
+from __future__ import annotations
+
+import posixpath
+import json
+import atexit
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from tkinter import font
@@ -32,9 +37,13 @@ import traceback
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, USLT
 import aiohttp
+try:
+    import requests
+except ImportError:
+    requests = None
 import subprocess
-import json
 import urllib.request
+from urllib.error import URLError
 import zipfile as zipfile_lib
 from pathlib import Path
 import uuid
@@ -54,9 +63,18 @@ class TaskType(Enum):
     GENERAL = "general"          # 通用任务
 
 
+class TaskCancelled(Exception):
+    """任务被取消（协作式取消的标准异常）"""
+
+
 @dataclass
 class Task:
-    """任务定义"""
+    """任务定义
+
+    func 可以是普通函数或协程函数。若函数签名接受 cancel_event 关键字参数，
+    调度器会自动注入一个 threading.Event，函数可通过轮询它实现协作式取消，
+    或在取消时调用 task.raise_if_cancelled()。
+    """
     task_id: str
     task_type: TaskType
     func: Callable                      # 要执行的函数（可以是普通函数或协程）
@@ -66,172 +84,367 @@ class Task:
     error_callback: Optional[Callable] = None    # 错误回调
     progress_callback: Optional[Callable] = None # 进度回调
     cancellable: bool = True                     # 是否可取消
+    timeout: Optional[float] = None              # 超时秒数，None 表示不限
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    def cancel(self):
+        """标记取消（由调度器调用）"""
+        self.cancel_event.set()
+
+    def is_cancelled(self):
+        return self.cancel_event.is_set()
+
+    def raise_if_cancelled(self):
+        """在长循环中调用，取消时抛出 TaskCancelled"""
+        if self.cancel_event.is_set():
+            raise TaskCancelled("任务已被取消")
 
 
 class TaskScheduler:
     """统一的后台任务调度器
-    
+
     特性：
-    - 单一 Worker 线程运行所有后台任务
-    - 内部维护单一 asyncio 事件循环
-    - 支持任务队列、取消、进度回调
-    - 线程安全的任务提交和状态查询
+    - 同步任务在线程池中真正并发执行（并发上限 = max_workers）
+    - 协程任务在专用事件循环线程中执行，与线程池互不阻塞
+    - 协作式取消：cancel_task() 会设置 Task.cancel_event
+    - 超时：Task.timeout 到期后取消并回调 error_callback
+    - 进度：Task.progress_callback 经结果队列转发到主线程执行
+    - stop() 用哨兵唤醒 worker，不依赖事件循环，可预期地退出
     """
-    
-    def __init__(self, max_concurrent_tts=3):
-        self.task_queue = queue.Queue()
+
+    # 关闭哨兵：放入队列即可唤醒 worker
+    _SENTINEL = object()
+
+    def __init__(self, max_concurrent_tts=None, max_workers=None, queue_size=1000):
+        # 兼容旧参数名 max_concurrent_tts；实际语义是"并发工作线程数"
+        workers = max_workers if max_workers is not None else (
+            max_concurrent_tts if max_concurrent_tts is not None else 3)
+        self.max_workers = max(1, int(workers))
+        self.max_concurrent_tts = self.max_workers  # 向后兼容属性
+
+        self.task_queue = queue.Queue(maxsize=max(1, int(queue_size)))
         self.result_queue = queue.Queue()
-        self.max_concurrent_tts = max_concurrent_tts
-        
+        self.dropped_callbacks = 0
+
         # 任务管理
         self.active_tasks: Dict[str, Task] = {}  # task_id -> Task
-        self.cancelled_tasks = set()              # 已取消的 task_id
-        self.task_lock = threading.Lock()
-        
-        # 事件循环和线程池
-        self.event_loop = None
+        self.cancelled_tasks = set()             # 已取消的 task_id
+        self._futures: Dict[str, Any] = {}       # task_id -> Future（关闭时用于取消）
+        self.task_lock = threading.RLock()
+
+        # 线程池与事件循环
         self.worker_thread = None
-        self.tts_executor = None
+        self.executor = None
+        self.event_loop = None
+        self.loop_thread = None
         self.running = False
-        
+        self._shutdown_timeout = 3.0
+
+    # ---------- 生命周期 ----------
     def start(self):
-        """启动调度器"""
-        if self.running:
-            return
-        
-        self.running = True
+        """启动调度器（幂等）"""
+        with self.task_lock:
+            if self.running:
+                return
+            self.running = True
+
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="TaskScheduler")
         self.worker_thread = threading.Thread(
-            target=self._worker_loop, 
-            daemon=True, 
-            name="TaskScheduler-Worker"
-        )
+            target=self._worker_loop, daemon=True, name="TaskScheduler-Dispatch")
         self.worker_thread.start()
-    
-    def stop(self):
-        """停止调度器"""
-        self.running = False
-        if self.event_loop:
+
+        self.event_loop = asyncio.new_event_loop()
+        self.loop_thread = threading.Thread(
+            target=self._loop_loop, daemon=True, name="TaskScheduler-EventLoop")
+        self.loop_thread.start()
+
+    def _loop_loop(self):
+        asyncio.set_event_loop(self.event_loop)
+        try:
+            self.event_loop.run_forever()
+        finally:
+            try:
+                pending = asyncio.all_tasks(self.event_loop)
+                for item in pending:
+                    item.cancel()
+                if pending:
+                    self.event_loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+            try:
+                self.event_loop.close()
+            except Exception:
+                pass
+
+    def stop(self, timeout=None):
+        """停止调度器：唤醒 worker、清空待执行任务、关闭线程池与事件循环"""
+        wait = self._shutdown_timeout if timeout is None else timeout
+        with self.task_lock:
+            if not self.running:
+                return
+            self.running = False
+
+        # 取消尚未执行的任务
+        with self.task_lock:
+            pending_ids = [tid for tid, task in self.active_tasks.items()
+                           if task.cancellable]
+            in_flight = list(self._futures.items())
+        for task_id in pending_ids:
+            self.cancel_task(task_id)
+
+        # 取消尚未开始执行的 future（Python 3.8 无 shutdown(cancel_futures=True)）
+        for _task_id, future in in_flight:
+            try:
+                if not future.running():
+                    future.cancel()
+            except Exception:
+                pass
+
+        try:
+            self.task_queue.put_nowait(self._SENTINEL)
+        except queue.Full:
+            pass
+
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=wait)
+
+        if self.executor:
+            # 先 cancel 掉排队中的工作，再等一小段时间让真正在跑的收尾，
+            # 避免"关不掉"和"被卡死任务无限阻塞退出"两种极端
+            try:
+                self.executor.shutdown(wait=False)
+            except Exception:
+                pass
+            for _task_id, future in in_flight:
+                try:
+                    future.result(timeout=wait)
+                except Exception:
+                    pass
+
+        if self.event_loop and self.loop_thread and self.loop_thread.is_alive():
             try:
                 self.event_loop.call_soon_threadsafe(self.event_loop.stop)
-            except:
+            except Exception:
                 pass
-    
+            self.loop_thread.join(timeout=wait)
+
+    # ---------- 任务提交与取消 ----------
     def submit_task(self, task: Task) -> str:
         """提交任务（线程安全）
-        
+
         Returns:
             task_id: 任务ID
+
+        Raises:
+            RuntimeError: 调度器未启动或队列已满
         """
+        if not self.running:
+            raise RuntimeError("TaskScheduler 未启动，请先调用 start()")
+
         with self.task_lock:
             self.active_tasks[task.task_id] = task
-        self.task_queue.put(task)
+            self.cancelled_tasks.discard(task.task_id)
+
+        try:
+            self.task_queue.put_nowait(task)
+        except queue.Full:
+            with self.task_lock:
+                self.active_tasks.pop(task.task_id, None)
+            raise RuntimeError("任务队列已满，请等待当前任务完成")
         return task.task_id
-    
+
     def cancel_task(self, task_id: str) -> bool:
-        """取消任务
-        
-        Returns:
-            bool: 是否成功标记为取消
-        """
+        """取消任务（设置 cancel_event，并尽量取消未开始执行的任务）"""
         with self.task_lock:
-            if task_id in self.active_tasks:
-                task = self.active_tasks[task_id]
-                if task.cancellable:
-                    self.cancelled_tasks.add(task_id)
-                    return True
-        return False
-    
+            task = self.active_tasks.get(task_id)
+            if task is None or not task.cancellable:
+                return False
+            self.cancelled_tasks.add(task_id)
+            task.cancel()
+            future = getattr(task, '_future', None)
+        # future.cancel() 只对尚未开始执行的任务有效
+        if future is not None:
+            try:
+                future.cancel()
+            except Exception:
+                pass
+        return True
+
     def is_task_cancelled(self, task_id: str) -> bool:
         """检查任务是否被取消"""
-        return task_id in self.cancelled_tasks
-    
+        with self.task_lock:
+            return task_id in self.cancelled_tasks
+
+    def get_cancel_event(self, task_id: str):
+        """取出任务的取消事件，便于把取消信号传进长循环"""
+        with self.task_lock:
+            task = self.active_tasks.get(task_id)
+            return task.cancel_event if task is not None else None
+
     def get_result(self):
         """获取结果（非阻塞）
-        
+
         Returns:
-            tuple: (task_id, success, result/error) 或 None
+            tuple: ("callback", callback, args) | ("progress", callback, args) | None
         """
         try:
             return self.result_queue.get_nowait()
         except queue.Empty:
             return None
-    
-    def _worker_loop(self):
-        """Worker 线程主循环"""
-        # 创建专用的事件循环
-        self.event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.event_loop)
-        
-        # 创建TTS线程池（用于并发TTS任务）
-        self.tts_executor = ThreadPoolExecutor(
-            max_workers=self.max_concurrent_tts, 
-            thread_name_prefix="TTS-Worker"
-        )
-        
-        try:
-            while self.running:
-                try:
-                    # 获取任务（阻塞，超时1秒）
-                    task = self.task_queue.get(timeout=1.0)
-                    
-                    # 检查是否已取消
-                    if task.task_id in self.cancelled_tasks:
-                        self._cleanup_task(task.task_id, cancelled=True)
-                        if task.error_callback:
-                            self.result_queue.put(("callback", task.error_callback, ("Task cancelled",)))
-                        continue
-                    
-                    # 执行任务
-                    self._execute_task(task)
-                    
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    print(f"Worker loop error: {e}")
-                    traceback.print_exc()
-        
-        finally:
-            # 清理资源
-            if self.tts_executor:
-                self.tts_executor.shutdown(wait=True)
-            if self.event_loop and not self.event_loop.is_closed():
-                self.event_loop.close()
-    
-    def _execute_task(self, task: Task):
-        """执行单个任务"""
-        try:
-            # 检查函数是否是协程
-            if asyncio.iscoroutinefunction(task.func):
-                # 异步函数：在事件循环中执行
-                result = self.event_loop.run_until_complete(
-                    task.func(*task.args, **task.kwargs)
-                )
-            else:
-                # 同步函数：直接执行
-                result = task.func(*task.args, **task.kwargs)
-            
-            # 任务成功，发送回调
-            if task.callback:
-                self.result_queue.put(("callback", task.callback, (result,)))
-            
-            self._cleanup_task(task.task_id, cancelled=False)
-            
-        except Exception as e:
-            # 任务失败，发送错误回调
-            print(f"Task {task.task_id} failed: {e}")
-            traceback.print_exc()
-            
-            if task.error_callback:
-                self.result_queue.put(("callback", task.error_callback, (e,)))
-            
-            self._cleanup_task(task.task_id, cancelled=False)
-    
-    def _cleanup_task(self, task_id: str, cancelled: bool):
-        """清理任务"""
+
+    def pending_count(self):
+        """待执行 + 执行中的任务数"""
         with self.task_lock:
-            self.active_tasks.pop(task_id, None)
-            if cancelled:
-                self.cancelled_tasks.discard(task_id)
+            return len(self.active_tasks)
+
+    # ---------- 内部实现 ----------
+    def _emit(self, callback, args):
+        """把回调投递到结果队列，由主线程执行"""
+        if callback is None:
+            return
+        try:
+            self.result_queue.put_nowait(("callback", callback, args))
+        except queue.Full:
+            self.dropped_callbacks += 1
+            print(f"警告: 回调队列已满，已丢弃 {self.dropped_callbacks} 个回调",
+                  file=sys.stderr)
+
+    def _emit_progress(self, task, args):
+        """转发任务进度回调（经结果队列，主线程执行）"""
+        if task.progress_callback is None:
+            return
+        try:
+            self.result_queue.put_nowait(("progress", task.progress_callback, args))
+        except queue.Full:
+            self.dropped_callbacks += 1
+
+    def _worker_loop(self):
+        """派发线程：只负责领取任务并派发，不阻塞等待任务完成"""
+        while True:
+            try:
+                task = self.task_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self.running:
+                    break
+                continue
+
+            if task is self._SENTINEL:
+                break
+
+            # 注意：任务完成前必须留在 active_tasks 中，
+            # 否则 cancel_task() 会找不到它、完成回调也无从判断是否重复上报。
+            with self.task_lock:
+                cancelled = task.task_id in self.cancelled_tasks
+            if cancelled or task.cancel_event.is_set():
+                self._finish_cancelled(task)
+                continue
+
+            try:
+                self._dispatch(task)
+            except Exception as e:
+                print(f"派发任务 {task.task_id} 失败: {e}", file=sys.stderr)
+                traceback.print_exc()
+                self._finish(task, task.error_callback, (e,))
+
+    def _finish(self, task, callback, args):
+        """上报任务结果（保证每个任务只上报一次）"""
+        with self.task_lock:
+            if task.task_id not in self.active_tasks:
+                return  # 已被超时看门狗处理
+            self.active_tasks.pop(task.task_id, None)
+            self.cancelled_tasks.discard(task.task_id)
+            self._futures.pop(task.task_id, None)
+        self._emit(callback, args)
+
+    def _build_kwargs(self, task):
+        """按需注入 cancel_event / progress_callback"""
+        kwargs = dict(task.kwargs)
+        if 'cancel_event' in kwargs:
+            return kwargs
+        try:
+            import inspect
+            params = inspect.signature(task.func).parameters
+        except (TypeError, ValueError):
+            return kwargs
+        if 'cancel_event' in params:
+            kwargs['cancel_event'] = task.cancel_event
+        if 'progress_callback' in params and task.progress_callback is not None:
+            kwargs['progress_callback'] = lambda *a: self._emit_progress(task, a)
+        return kwargs
+
+    def _dispatch(self, task):
+        """按同步/异步分别派发到线程池或事件循环"""
+        kwargs = self._build_kwargs(task)
+
+        if asyncio.iscoroutinefunction(task.func):
+            if self.event_loop is None or self.event_loop.is_closed():
+                raise RuntimeError("事件循环不可用，无法执行协程任务")
+            future = asyncio.run_coroutine_threadsafe(
+                task.func(*task.args, **kwargs), self.event_loop)
+        else:
+            def run_sync():
+                return task.func(*task.args, **kwargs)
+            future = self.executor.submit(run_sync)
+
+        task._future = future
+        with self.task_lock:
+            self._futures[task.task_id] = future
+        future.add_done_callback(lambda f: self._on_task_done(task, f))
+        self._watch_timeout(task, future)
+
+    def _watch_timeout(self, task, future):
+        """超时看门狗：到期未完成则取消并回调错误"""
+        if not task.timeout or task.timeout <= 0:
+            return
+
+        def watchdog():
+            try:
+                future.result(timeout=task.timeout)
+            except Exception:
+                pass
+            if future.done():
+                return  # 正常结束路径会负责上报
+            self.cancel_task(task.task_id)
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            self._finish(
+                task, task.error_callback,
+                (TimeoutError(f"任务执行超时（>{task.timeout}s）: {task.task_id}"),))
+
+        threading.Thread(target=watchdog, daemon=True,
+                         name="TaskScheduler-Timeout").start()
+
+    def _on_task_done(self, task, future):
+        """任务结束（成功/失败/取消）的统一收尾"""
+        with self.task_lock:
+            in_flight = task.task_id in self.active_tasks
+            was_cancelled = task.task_id in self.cancelled_tasks
+        if not in_flight:
+            return  # 超时看门狗已上报
+
+        if was_cancelled or task.cancel_event.is_set():
+            self._finish(task, task.error_callback,
+                         (TaskCancelled("任务已被取消"),))
+            return
+
+        try:
+            result = future.result()
+        except TaskCancelled as e:
+            self._finish(task, task.error_callback, (e,))
+        except Exception as e:
+            print(f"Task {task.task_id} failed: {e}", file=sys.stderr)
+            traceback.print_exc()
+            self._finish(task, task.error_callback, (e,))
+        else:
+            self._finish(task, task.callback, (result,))
+
+    def _finish_cancelled(self, task):
+        """任务在开始执行前就被取消"""
+        self._finish(task, task.error_callback, (TaskCancelled("任务已被取消"),))
 
 
 # ===== 配置选项 =====
@@ -243,14 +456,26 @@ class AppConfig:
     DEFAULT_TTS_ENGINE = "edge-tts"  # 默认TTS引擎
     MAX_RETRIES = 3  # TTS最大重试次数
     RETRY_DELAY_SECONDS = 5  # TTS重试间隔（秒）
-    CHARS_PER_SECOND = 0.3  # 估算每个字的朗读时间（秒）
+    # 朗读速度的唯一来源：约 4.5 个汉字/秒（edge-tts 默认语速实测值）。
+    # 旧代码同时存在 0.3 秒/字 与 80 字/秒 两个互相矛盾的估算，此处统一。
+    CHARS_PER_SECOND = 4.5  # 每秒朗读的字符数
+    READING_SECONDS_PER_CHAR = 1.0 / 4.5  # 每个字符的朗读时间（秒）
+    # edge-tts 单次请求的文本长度上限，超出必须分块（否则长章节必然中途断流）
+    MAX_TTS_CHARS = 1200
     
     # 文件配置
     DEFAULT_ARTIST = "未知作者"  # MP3默认艺术家
     DEFAULT_CHARS_PER_LINE = 15  # LRC歌词每行字数
     MAX_FILENAME_LENGTH = 200  # 文件名最大长度
-    TEMP_DIR = os.path.join(tempfile.gettempdir(), "epub2mp3")  # 临时目录
+    # 兼容常量：实际临时文件已改为实例级目录（见 EpubToMp3App.session_temp_dir），
+    # 此常量不再作为任何清理目标，避免两个实例互删文件。
+    TEMP_DIR = os.path.join(tempfile.gettempdir(), "epub2mp3")
     LYRIC_LANG = "zho"  # 歌词语言代码
+
+    # 配置持久化位置
+    CONFIG_DIR = os.path.join(os.getenv('APPDATA') or os.path.expanduser('~'), 'epubReader')
+    CONFIG_PATH = os.path.join(CONFIG_DIR, 'config.json')
+    LOG_PATH = os.path.join(CONFIG_DIR, 'epubReader.log')
     
     # FFmpeg配置
     FFMPEG_DIR = os.path.join(os.getenv('APPDATA') or os.path.expanduser('~'), 'epubReader', 'ffmpeg')
@@ -265,6 +490,15 @@ class AppConfig:
     DOWNLOAD_TIMEOUT = 30  # 下载超时时间（秒）
     DOWNLOAD_MAX_RETRIES = 3  # 下载最大重试次数
 
+    @staticmethod
+    def bundled_ffmpeg_dir():
+        """PyInstaller 打包运行时随包附带的 ffmpeg 目录（无则返回 None）"""
+        base = getattr(sys, '_MEIPASS', None)
+        if not base:
+            return None
+        candidate = os.path.join(base, 'ffmpeg')
+        return candidate if os.path.isdir(candidate) else None
+
 # 向后兼容：保留全局变量
 DEFAULT_VOICE = AppConfig.DEFAULT_VOICE
 DEFAULT_ARTIST = AppConfig.DEFAULT_ARTIST
@@ -278,6 +512,120 @@ FFMPEG_PATH = AppConfig.FFMPEG_PATH
 FFMPEG_DOWNLOAD_URLS = AppConfig.FFMPEG_DOWNLOAD_URLS
 DOWNLOAD_TIMEOUT = AppConfig.DOWNLOAD_TIMEOUT
 DOWNLOAD_MAX_RETRIES = AppConfig.DOWNLOAD_MAX_RETRIES
+
+
+# ===== 日志与配置持久化 =====
+def _retry_io(func, attempts=4, base_delay=0.25):
+    """执行可能因短暂占用而失败的文件操作（Windows 上偶发 Permission denied）
+
+    Returns:
+        tuple: (success: bool, result_or_error)
+    """
+    last_error = None
+    for index in range(attempts):
+        try:
+            return True, func()
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(base_delay * (index + 1))
+        except OSError as exc:
+            last_error = exc
+            if getattr(exc, 'errno', None) not in (13, 11, 32, 33):
+                break
+            time.sleep(base_delay * (index + 1))
+    return False, last_error
+
+
+
+def setup_logging(log_path=None, level=None):
+    """配置文件日志（轮转），并把 print 的诊断信息纳入统一日志
+
+    Returns:
+        logging.Logger: 已配置的 logger
+    """
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    logger = logging.getLogger('epubReader')
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(level or logging.INFO)
+    target = log_path or AppConfig.LOG_PATH
+
+    def build_handler():
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        handler = RotatingFileHandler(
+            target, maxBytes=2 * 1024 * 1024, backupCount=3, encoding='utf-8')
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(threadName)s %(message)s'))
+        return handler
+
+    # 短暂占用（同步客户端/杀毒扫描）很常见，重试几次即可
+    ok, result = _retry_io(build_handler)
+    if ok:
+        logger.addHandler(result)
+    else:
+        print(f"无法建立日志文件（可忽略）: {result}", file=sys.stderr)
+
+    # 同时输出到 stderr，便于命令行运行时观察
+    stream = logging.StreamHandler()
+    stream.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    logger.addHandler(stream)
+    return logger
+
+
+class ConfigStore:
+    """把用户设置持久化到 %APPDATA%\\epubReader\\config.json
+
+    只保存"纯数据"设置；损坏或缺失时静默回退到默认值，绝不让配置问题阻断启动。
+    """
+
+    KEYS = (
+        'tts_engine', 'voice', 'chars_per_line',
+        'output_format', 'concurrent_threads', 'output_dir', 'album', 'artist',
+    )
+
+    def __init__(self, path=None):
+        self.path = path or AppConfig.CONFIG_PATH
+        self.data = {}
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, 'r', encoding='utf-8') as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                self.data = {k: v for k, v in payload.items() if k in self.KEYS}
+        except FileNotFoundError:
+            self.data = {}
+        except (ValueError, OSError) as e:
+            print(f"读取配置失败，使用默认值: {e}", file=sys.stderr)
+            self.data = {}
+        return self.data
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def update(self, **values):
+        self.data.update({k: v for k, v in values.items() if k in self.KEYS})
+
+    def save(self):
+        """保存配置；失败只记录日志，不影响使用"""
+        def write():
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(self.data, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+            return True
+
+        ok, result = _retry_io(write)
+        if not ok:
+            print(f"保存配置失败（可忽略）: {result}", file=sys.stderr)
+        return ok
 
 
 # ===== EPUB处理模块 =====
@@ -364,9 +712,24 @@ class EpubReader:
             return False
 
     def close(self):
-        """关闭EPUB文件"""
+        """关闭EPUB文件，释放 zipfile 与 ebooklib 持有的资源"""
         if self.epub_zip:
-            self.epub_zip.close()
+            try:
+                self.epub_zip.close()
+            except Exception as e:
+                print(f"关闭EPUB压缩包失败: {e}", file=sys.stderr)
+            finally:
+                self.epub_zip = None
+        # ebooklib 的 EpubBook 可能持有内部文件句柄，尽量一并释放
+        book = self.book
+        if book is not None:
+            closer = getattr(book, 'close', None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:
+                    print(f"关闭EPUB书籍对象失败: {e}", file=sys.stderr)
+            self.book = None
 
     def get_title(self):
         """获取书籍标题"""
@@ -466,7 +829,7 @@ class EpubReader:
                                 './/*{http://www.idpf.org/2007/opf}item') or []:
                             if item.get('id') == cover_id:
                                 cover_href = item.get('href')
-                                cover_path = os.path.join(self.opf_dir, cover_href).replace('\\', '/')
+                                cover_path = posixpath.join(self.opf_dir, cover_href).lstrip('/')
                                 try:
                                     return self.epub_zip.read(cover_path)
                                 except:
@@ -479,9 +842,9 @@ class EpubReader:
                 if manifest:
                     for item in manifest.findall('.//opf:item', namespaces) or manifest.findall(
                             './/*{http://www.idpf.org/2007/opf}item') or []:
-                        if 'cover-image' in item.get('properties', '').split():  # Check for 'cover-image' property
+                        if 'cover-image' in (item.get('properties') or '').split():  # Check for 'cover-image' property
                             cover_href = item.get('href')
-                            cover_path = os.path.join(self.opf_dir, cover_href).replace('\\', '/')
+                            cover_path = posixpath.join(self.opf_dir, cover_href).lstrip('/')
                             try:
                                 return self.epub_zip.read(cover_path)
                             except:
@@ -494,14 +857,14 @@ class EpubReader:
                 if manifest:
                     for item in manifest.findall('.//opf:item', namespaces) or manifest.findall(
                             './/*{http://www.idpf.org/2007/opf}item') or []:
-                        item_id = item.get('id', '').lower()
-                        item_href = item.get('href', '').lower()
-                        media_type = item.get('media-type', '')
+                        item_id = (item.get('id') or '').lower()
+                        item_href = (item.get('href') or '').lower()
+                        media_type = item.get('media-type') or ''
 
                         if (media_type.startswith('image/') and
                                 ('cover' in item_id or 'cover' in item_href)):
                             cover_href = item.get('href')
-                            cover_path = os.path.join(self.opf_dir, cover_href).replace('\\', '/')
+                            cover_path = posixpath.join(self.opf_dir, cover_href).lstrip('/')
                             try:
                                 return self.epub_zip.read(cover_path)
                             except:
@@ -861,8 +1224,8 @@ def generate_simple_lrc(text, chars_per_line):
     cumulative_chars = 0
     
     for line in lines:
-        # 根据累计字符数估算时间
-        estimated_seconds = cumulative_chars * AppConfig.CHARS_PER_SECOND
+        # 根据累计字符数估算时间（仅在 TTS 未提供时间轴时使用）
+        estimated_seconds = cumulative_chars * AppConfig.READING_SECONDS_PER_CHAR
         minutes = int(estimated_seconds // 60)
         seconds = int(estimated_seconds % 60)
         milliseconds = int((estimated_seconds % 1) * 100)
@@ -873,6 +1236,246 @@ def generate_simple_lrc(text, chars_per_line):
         cumulative_chars += len(line)
     
     return '\n'.join(lrc_lines)
+
+
+# ===== 长文本分块与 SRT 时间轴工具 =====
+# edge-tts 对单次请求的文本长度有上限，超长章节必须分块合成后拼接，
+# 否则会在流的中途断开，表现为“重试 3 次后仍然生成失败”。
+_SENTENCE_END = re.compile(r'(?<=[。！？!?；;])')
+_MINOR_PAUSE = re.compile(r'(?<=[，,、：:）)】」』])')
+_SRT_TIME = re.compile(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})')
+
+
+def _split_by_boundary(text, pattern, limit):
+    """按边界正则切分文本，并把碎片合并成不超过 limit 的块"""
+    result = []
+    current = ""
+    for segment in pattern.split(text):
+        if len(current) + len(segment) <= limit:
+            current += segment
+        else:
+            if current:
+                result.append(current)
+            current = segment
+    if current:
+        result.append(current)
+    return result
+
+
+def _hard_split(text, limit):
+    """无标点的超长段落兜底硬切"""
+    return [text[i:i + limit] for i in range(0, len(text), limit)] if text else []
+
+
+def chunk_text(text, limit=None):
+    """把长文本切成不超过 limit 字符的块（优先在句子/停顿标点处断开）
+
+    Returns:
+        list: 文本块列表；输入为空时返回空列表
+    """
+    if limit is None:
+        limit = AppConfig.MAX_TTS_CHARS
+    if limit < 1:
+        limit = AppConfig.MAX_TTS_CHARS
+    if not text:
+        return []
+
+    chunks = []
+    buffer = ""
+    for paragraph in text.splitlines():
+        if not paragraph.strip():
+            continue
+        if len(buffer) + len(paragraph) + 1 <= limit:
+            buffer = f"{buffer}\n{paragraph}" if buffer else paragraph
+            continue
+        if buffer:
+            chunks.append(buffer)
+            buffer = ""
+        for piece in _split_by_boundary(paragraph, _SENTENCE_END, limit):
+            for sub in _split_by_boundary(piece, _MINOR_PAUSE, limit):
+                if len(sub) <= limit:
+                    if sub:
+                        chunks.append(sub)
+                else:
+                    chunks.extend(_hard_split(sub, limit))
+    if buffer:
+        chunks.append(buffer)
+    return chunks
+
+
+def _format_srt_time(total_ms):
+    """毫秒 -> SRT 时间戳 00:00:00,000"""
+    if total_ms < 0:
+        total_ms = 0
+    hours, remainder = divmod(int(total_ms), 3600000)
+    minutes, remainder = divmod(remainder, 60000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def shift_srt(srt_content, offset_ms, index_base=0):
+    """整体平移 SRT 的时间轴与序号，用于分块合成后拼接
+
+    Args:
+        srt_content: 单个文本块的 SRT 内容
+        offset_ms: 该块在整章音频中的起始毫秒偏移
+        index_base: 前面已产生的字幕条数（用于重新编号）
+
+    Returns:
+        tuple: (平移后的SRT文本, 新的字幕条数)
+    """
+    if not srt_content or not srt_content.strip():
+        return "", index_base
+
+    blocks = [b for b in srt_content.strip().split('\n\n') if b.strip()]
+    output = []
+    index = index_base
+    for block in blocks:
+        lines = block.split('\n')
+        time_line_pos = next(
+            (pos for pos, line in enumerate(lines) if '-->' in line), None)
+        if time_line_pos is None:
+            continue
+        matches = list(_SRT_TIME.finditer(lines[time_line_pos]))
+        if not matches:
+            continue
+        start = (int(matches[0].group(1)) * 3600 + int(matches[0].group(2)) * 60
+                 + int(matches[0].group(3))) * 1000 + int(matches[0].group(4))
+        end = None
+        if len(matches) > 1:
+            end = (int(matches[1].group(1)) * 3600 + int(matches[1].group(2)) * 60
+                   + int(matches[1].group(3))) * 1000 + int(matches[1].group(4))
+        text = '\n'.join(lines[time_line_pos + 1:])
+        if not text.strip():
+            continue
+        index += 1
+        start += offset_ms
+        end = (end + offset_ms) if end is not None else start + 3000
+        output.append(f"{index}\n{_format_srt_time(start)} --> {_format_srt_time(end)}\n{text}")
+    if not output:
+        return "", index_base
+    return '\n\n'.join(output) + '\n', index
+
+
+# ===== MP3 时长探测（纯标准库，不依赖 mutagen） =====
+# 注意：edge-tts 输出的是 24kHz 的 MPEG-2 Layer III 帧（帧长 144 字节），
+# 而不是 MPEG-1；按 MPEG-1 解析会把时长算成真实值的一半，进而让字幕错位。
+_MPEG1_BITRATES = {
+    1: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],  # Layer I
+    2: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],      # Layer II
+    3: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],       # Layer III
+}
+_MPEG2_BITRATES = {
+    1: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+    2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+    3: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+}
+_MPEG1_SAMPLE_RATES = (44100, 48000, 32000)
+
+
+def mp3_duration_ms(path):
+    """遍历 MPEG 音频帧计算时长（毫秒），失败返回 0
+
+    这是分块拼接时推进字幕时间轴的关键：用真实音频长度而不是估算值，
+    避免 LRC 与音频逐渐错位。
+    """
+    try:
+        with open(path, 'rb') as fh:
+            data = fh.read()
+    except OSError:
+        return 0
+
+    position = 0
+    total_samples = 0
+    sample_rate = 0
+    size = len(data)
+    while position + 4 <= size:
+        if data[position] != 0xFF or (data[position + 1] & 0xE0) != 0xE0:
+            position += 1
+            continue
+
+        version_bits = (data[position + 1] >> 3) & 0x03
+        layer_bits = (data[position + 1] >> 1) & 0x03
+        bitrate_index = (data[position + 2] >> 4) & 0x0F
+        rate_index = (data[position + 2] >> 2) & 0x03
+        padding = (data[position + 2] >> 1) & 0x01
+
+        # version_bits: 3=MPEG-1, 2=MPEG-2, 0=MPEG-2.5, 1=保留
+        # layer_bits:   3=Layer I, 2=Layer II, 1=Layer III, 0=保留
+        if version_bits == 1 or layer_bits == 0 or rate_index == 3:
+            position += 1
+            continue
+        layer = 4 - layer_bits
+        if version_bits == 3:
+            bitrate = _MPEG1_BITRATES[layer][bitrate_index] * 1000
+            rate = _MPEG1_SAMPLE_RATES[rate_index]
+        else:
+            factor = 2 if version_bits == 2 else 4
+            bitrate = _MPEG2_BITRATES[layer][bitrate_index] * 1000
+            rate = _MPEG1_SAMPLE_RATES[rate_index] // factor
+        if not bitrate:
+            position += 1
+            continue
+
+        if layer == 1:
+            samples = 384
+            frame_length = (12 * bitrate // rate + padding) * 4
+        elif layer == 3 and version_bits != 3:
+            # MPEG-2/2.5 Layer III：每帧 576 个采样，一个"槽"即 1 字节
+            samples = 576
+            frame_length = 72 * bitrate // rate + padding
+        else:
+            samples = 1152
+            frame_length = 144 * bitrate // rate + padding
+
+        if frame_length <= 4:
+            position += 1
+            continue
+        total_samples += samples
+        sample_rate = rate
+        position += frame_length
+
+    if not total_samples or not sample_rate:
+        return 0
+    return int(total_samples * 1000.0 / sample_rate)
+
+
+def get_audio_duration_ms(path):
+    """获取音频文件时长（毫秒）：优先 mutagen，其次自带 MPEG 解析，最后返回 0"""
+    try:
+        audio = MP3(path)
+        if audio.info and audio.info.length > 0:
+            return int(audio.info.length * 1000)
+    except Exception:
+        pass
+    return mp3_duration_ms(path)
+
+
+async def run_coros_with_limit(coros, limit):
+    """并发执行多个协程，最多同时 limit 个（单个失败不影响其他任务）
+
+    Args:
+        coros: 协程的可迭代对象
+        limit: 最大并发数
+
+    Returns:
+        list: 每个协程的结果；抛异常的条目为异常对象本身
+    """
+    semaphore = asyncio.Semaphore(max(1, int(limit or 1)))
+
+    async def guarded(coro):
+        async with semaphore:
+            try:
+                return await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return exc
+
+    coro_list = list(coros)
+    if not coro_list:
+        return []
+    return await asyncio.gather(*(guarded(c) for c in coro_list))
 
 
 # ===== TTS引擎抽象层 =====
@@ -901,48 +1504,217 @@ class TTSEngine:
         raise NotImplementedError()
 
 
+def _describe_edge_tts_failure(error):
+    """把 edge-tts 的底层错误翻译成用户能理解、能行动的提示
+
+    403 是当前最常见的情况，而且**原因已经查清，不是网络问题**：
+    微软的朗读端点会校验握手 URL 里的 `Sec-MS-GEC-Version`，要求它形如
+    `2-<Chromium 版本>`；edge-tts 7.2.x 及更早发的是 `1-...`，被一律拒绝
+    （同一时刻用同一 token 访问 /voices/list 仍返回 200，说明网络和凭据都正常）。
+    edge-tts 7.3.0 起改发 `2-...`，实测即可成功合成。
+
+    实测对照（本机，其他条件完全相同）：
+        edge-tts 7.2.8 → Sec-MS-GEC-Version=1-143.0.3650.75 → 403
+        edge-tts 7.3.1 → Sec-MS-GEC-Version=2-143.0.3650.75 → 合成成功
+    """
+    text = str(error)
+    if '403' in text or 'Invalid response status' in text:
+        return (
+            "诊断：微软语音服务返回 403（拒绝 WebSocket 握手）。\n"
+            "  原因：edge-tts 版本过旧。服务端要求 Sec-MS-GEC-Version 以 '2-' 开头，\n"
+            "  7.2.x 及更早发的是 '1-'，因此被一律拒绝（不是网络、代理或密钥问题）。\n"
+            "  解决：升级到 edge-tts 7.3.1 或更高（pip install -U edge-tts）；\n"
+            "  若使用的是打包好的 exe，需要升级依赖后重新打包。\n"
+            "  替代：改用本机语音引擎（pyttsx3，离线可用，需 Windows + FFmpeg）。"
+        )
+    if '401' in text or 'Unauthorized' in text:
+        return "诊断：语音服务拒绝了凭据，可能是 edge-tts 版本过旧，请升级后重试。"
+    if 'Connection' in text or 'timeout' in text.lower() or 'Timeout' in text:
+        return "诊断：连接语音服务超时，请检查网络、代理或稍后重试。"
+    return None
+
+
+# 最近一次 TTS 失败的诊断信息。
+#
+# 三个引擎的 generate_audio 只返回 (success, srt)，没有渠道回传失败原因；
+# 而打包成窗口程序后 stderr 是空的（`__main__` 里那段重定向只在 pythonw.exe 下生效），
+# 于是失败原因彻底丢失 —— 用户只看到"生成失败: 章节名"，弹窗却让他"查看日志了解详情"。
+# 这里留一份给调用方读取，用于写进界面日志与失败记录。
+LAST_TTS_FAILURE = None
+
+
+def _record_tts_failure(error):
+    """记录 TTS 失败原因：写进应用日志，并存一份给调用方展示
+
+    Returns:
+        str: 可直接展示的失败原因
+    """
+    global LAST_TTS_FAILURE
+    hint = _describe_edge_tts_failure(error)
+    detail = hint or str(error)
+    LAST_TTS_FAILURE = detail
+    # 窗口模式下 stderr 什么都收不到，必须走日志文件（logging 在本文件里一直是局部导入）
+    try:
+        import logging
+        logging.getLogger('epubReader').warning(
+            "TTS 失败: %s", ' '.join(detail.split()))
+    except Exception:
+        pass
+    print(detail, file=sys.stderr)
+    return detail
+
+
 class EdgeTTSEngine(TTSEngine):
     """Microsoft Edge TTS引擎"""
-    
+
+    # 内置静态列表：标记存在即表示无需后台枚举
+    STATIC_VOICES = [
+        ("zh-CN-YunjianNeural", "云健 (男声)"),
+        ("zh-CN-XiaoxiaoNeural", "晓晓 (女声)"),
+        ("zh-CN-YunxiNeural", "云希 (男童声)"),
+        ("zh-CN-XiaoyiNeural", "晓伊 (女声)"),
+        ("zh-CN-YunyangNeural", "云扬 (男声)"),
+        ("zh-CN-liaoning-XiaobeiNeural", "晓北 (女声,辽宁口音)"),
+        ("en-US-BrianMultilingualNeural", "Brian (英文,多语言)"),
+        ("en-US-AndrewMultilingualNeural", "Andrew (英文,多语言)"),
+        ("en-US-EmmaMultilingualNeural", "Emma (英文,多语言)"),
+    ]
+
     @staticmethod
     async def generate_audio(text, output_audio, voice, **kwargs):
-        """Edge-TTS生成音频"""
+        """Edge-TTS生成音频（超长文本自动分块合成后拼接）
+
+        额外支持的 kwargs:
+            max_chars: 单个文本块的最大字符数（默认 AppConfig.MAX_TTS_CHARS）
+            rate / pitch: 直接透传给 edge_tts.Communicate
+            progress_callback: callback(done_blocks, total_blocks)
+
+        Returns:
+            tuple: (success: bool, srt_content: str or None)
+        """
         try:
-            communicate = edge_tts.Communicate(text, voice)
-            submaker = edge_tts.SubMaker()
-            os.makedirs(os.path.dirname(output_audio), exist_ok=True)
-            
-            with open(output_audio, "wb") as audio_file:
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        audio_file.write(chunk["data"])
-                    elif chunk["type"] == "WordBoundary":
-                        submaker.feed(chunk)
-            
-            srt_content = submaker.get_srt()
-            return True, srt_content
+            output_dir = os.path.dirname(output_audio)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            if not text or not text.strip():
+                print("Edge-TTS: 文本为空，跳过", file=sys.stderr)
+                return False, None
+
+            chunks = chunk_text(text, kwargs.get('max_chars')) or [text]
+            progress_callback = kwargs.get('progress_callback')
+
+            task_temp_dir = tempfile.mkdtemp(prefix='epubReader_tts_')
+            part_files = []
+            srt_blocks = []
+            index_base = 0
+            offset_ms = 0
+
+            try:
+                # edge-tts 7.x 默认 boundary='SentenceBoundary'，而旧代码只认 WordBoundary，
+                # 结果是字幕永远为空、LRC 退化成“按字数估算时间”。这里显式请求 WordBoundary，
+                # 并同时兼容两种边界事件，版本变化时不会再次静默失效。
+                boundary_mode = kwargs.get('boundary', 'WordBoundary')
+                for position, chunk in enumerate(chunks):
+                    part_path = os.path.join(task_temp_dir, f"{position:04d}.part.mp3")
+                    communicate = edge_tts.Communicate(
+                        chunk, voice,
+                        rate=kwargs.get('rate', '+0%'),
+                        pitch=kwargs.get('pitch', '+0Hz'),
+                        boundary=boundary_mode,
+                    )
+                    submaker = edge_tts.SubMaker()
+                    audio_bytes = 0
+                    boundary_events = 0
+                    with open(part_path, "wb") as audio_file:
+                        async for piece in communicate.stream():
+                            piece_type = piece["type"]
+                            if piece_type == "audio":
+                                audio_file.write(piece["data"])
+                                audio_bytes += len(piece["data"])
+                            elif piece_type in ("WordBoundary", "SentenceBoundary"):
+                                boundary_events += 1
+                                submaker.feed(piece)
+
+                    # 单块为空说明该块被服务端拒绝，必须报错而不是产出静音
+                    if audio_bytes == 0:
+                        raise RuntimeError(
+                            f"第 {position + 1}/{len(chunks)} 块未产生音频（{len(chunk)} 字）")
+                    if boundary_events == 0:
+                        print(f"警告: 第 {position + 1} 块未收到任何字幕边界事件，"
+                              f"该块字幕将退化为按字数估算", file=sys.stderr)
+
+                    shifted_srt, index_base = shift_srt(
+                        submaker.get_srt(), offset_ms, index_base)
+                    if shifted_srt:
+                        srt_blocks.append(shifted_srt)
+
+                    # 用该块的真实时长推进时间轴偏移，保证字幕与音频严格对齐。
+                    # 不依赖 mutagen：缺失时 MP3() 未定义，原实现会退化成
+                    # len(chunk)/0.3 秒的估算（≈3.3 字/秒，与实际差 24 倍），字幕整体错位。
+                    duration_ms = get_audio_duration_ms(part_path)
+                    if duration_ms <= 0:
+                        # 兜底：按中文约 4.5 字/秒估算
+                        duration_ms = int(len(chunk) / 4.5 * 1000)
+                        print(f"警告: 无法读取第 {position + 1} 块时长，"
+                              f"使用估算 {duration_ms}ms", file=sys.stderr)
+                    offset_ms += duration_ms
+
+                    part_files.append(part_path)
+                    if progress_callback:
+                        try:
+                            progress_callback(position + 1, len(chunks))
+                        except Exception:
+                            pass
+
+                # 按顺序拼接为单一 MP3（写完后立即关闭，便于失败时清理临时目录）
+                merged_buffer = open(output_audio, "wb")
+                try:
+                    for part_path in part_files:
+                        with open(part_path, "rb") as source:
+                            shutil.copyfileobj(source, merged_buffer)
+                finally:
+                    merged_buffer.close()
+
+                srt_content = '\n'.join(srt_blocks) if srt_blocks else ''
+                return True, srt_content
+
+            finally:
+                # 失败时清理半成品，避免留下损坏的 MP3 被后续流程误用
+                if not os.path.exists(output_audio):
+                    try:
+                        if os.path.exists(output_audio):
+                            os.remove(output_audio)
+                    except OSError:
+                        pass
+                shutil.rmtree(task_temp_dir, ignore_errors=True)
+
         except Exception as e:
             print(f"Edge-TTS生成失败: {e}", file=sys.stderr)
+            traceback.print_exc()
+            # 记进应用日志并留一份给调用方展示（窗口模式下 stderr 是空的）
+            _record_tts_failure(e)
             return False, None
     
     @staticmethod
     def get_available_voices():
         """获取Edge-TTS可用语音"""
-        return [
-            ("zh-CN-YunjianNeural", "云健 (男声)"),
-            ("zh-CN-XiaoxiaoNeural", "晓晓 (女声)"),
-            ("zh-CN-YunxiNeural", "云希 (男童声)"),
-            ("zh-CN-XiaoyiNeural", "晓伊 (女声)"),
-            ("zh-CN-YunyangNeural", "云扬 (男声)"),
-            ("zh-CN-liaoning-XiaobeiNeural", "晓北 (女声,辽宁口音)"),
-            ("en-US-BrianMultilingualNeural", "Brian (英文,多语言)"),
-            ("en-US-AndrewMultilingualNeural", "Andrew (英文,多语言)"),
-            ("en-US-EmmaMultilingualNeural", "Emma (英文,多语言)"),
-        ]
+        return list(EdgeTTSEngine.STATIC_VOICES)
 
 
 class GoogleTTSEngine(TTSEngine):
     """Google TTS引擎 (gTTS)"""
+
+    STATIC_VOICES = [
+        ("zh-CN", "中文 (简体)"),
+        ("zh-TW", "中文 (繁体)"),
+        ("en", "English"),
+        ("ja", "日本語"),
+        ("ko", "한국어"),
+        ("fr", "Français"),
+        ("de", "Deutsch"),
+        ("es", "Español"),
+    ]
     
     @staticmethod
     async def generate_audio(text, output_audio, voice, **kwargs):
@@ -965,7 +1737,6 @@ class GoogleTTSEngine(TTSEngine):
             def _generate_with_gtts():
                 """生成gTTS音频，强制禁用代理"""
                 import os as os_module
-                import requests
                 from unittest.mock import patch
                 
                 # 保存原始代理设置
@@ -981,22 +1752,27 @@ class GoogleTTSEngine(TTSEngine):
                     for key in proxy_keys:
                         os_module.environ.pop(key, None)
                     
-                    # 使用 monkey patch 强制禁用 requests 的代理
-                    original_merge_environment_settings = requests.Session.merge_environment_settings
-                    
-                    def no_proxy_merge_environment_settings(self, url, proxies, stream, verify, cert):
-                        # 调用原始方法，但强制 proxies 为空
-                        return original_merge_environment_settings(self, url, {}, stream, verify, cert)
-                    
-                    requests.Session.merge_environment_settings = no_proxy_merge_environment_settings
-                    
-                    try:
+                    if requests:
+                        # 使用 monkey patch 强制禁用 requests 的代理
+                        original_merge_environment_settings = requests.Session.merge_environment_settings
+                        
+                        def no_proxy_merge_environment_settings(self, url, proxies, stream, verify, cert):
+                            # 调用原始方法，但强制 proxies 为空
+                            return original_merge_environment_settings(self, url, {}, stream, verify, cert)
+                        
+                        requests.Session.merge_environment_settings = no_proxy_merge_environment_settings
+                        
+                        try:
+                            # 创建gTTS对象并生成音频
+                            tts = gTTS(text=text, lang=lang, slow=False)
+                            tts.save(output_audio)
+                        finally:
+                            # 恢复原始方法
+                            requests.Session.merge_environment_settings = original_merge_environment_settings
+                    else:
                         # 创建gTTS对象并生成音频
                         tts = gTTS(text=text, lang=lang, slow=False)
                         tts.save(output_audio)
-                    finally:
-                        # 恢复原始方法
-                        requests.Session.merge_environment_settings = original_merge_environment_settings
                     
                 finally:
                     # 恢复代理设置
@@ -1042,20 +1818,14 @@ class GoogleTTSEngine(TTSEngine):
     @staticmethod
     def get_available_voices():
         """获取gTTS可用语言"""
-        return [
-            ("zh-CN", "中文 (简体)"),
-            ("zh-TW", "中文 (繁体)"),
-            ("en", "English"),
-            ("ja", "日本語"),
-            ("ko", "한국어"),
-            ("fr", "Français"),
-            ("de", "Deutsch"),
-            ("es", "Español"),
-        ]
+        return list(GoogleTTSEngine.STATIC_VOICES)
 
 
 class Pyttsx3Engine(TTSEngine):
     """离线TTS引擎 (pyttsx3)。注意：需要FFmpeg转换WAV为MP3"""
+
+    # 未安装/未成功枚举前的占位列表（枚举在后台线程进行，避免卡住界面）
+    STATIC_VOICES = [("default", "系统默认")]
     
     @staticmethod
     async def generate_audio(text, output_audio, voice, **kwargs):
@@ -1158,10 +1928,155 @@ TTS_ENGINES = {
     "pyttsx3": Pyttsx3Engine,
 }
 
+# FFmpeg/FFprobe 可执行文件候选名（按平台）
+if sys.platform == 'win32':
+    FFMPEG_EXE_NAMES = ('ffmpeg.exe', 'ffmpeg.bat', 'ffmpeg.cmd', 'ffmpeg')
+    FFPROBE_EXE_NAMES = ('ffprobe.exe', 'ffprobe.bat', 'ffprobe')
+else:
+    FFMPEG_EXE_NAMES = ('ffmpeg',)
+    FFPROBE_EXE_NAMES = ('ffprobe',)
+
 
 def get_tts_engine(engine_name):
     """获取TTS引擎实例"""
     return TTS_ENGINES.get(engine_name, EdgeTTSEngine)
+
+
+def safe_extract_zip(zip_path, target_dir):
+    """安全解压 ZIP：拒绝路径穿越（Zip Slip），返回是否成功
+
+    Args:
+        zip_path: ZIP 文件路径
+        target_dir: 目标目录（会被创建）
+
+    Returns:
+        tuple: (success: bool, error_msg: str)
+    """
+    target_root = os.path.realpath(target_dir)
+    os.makedirs(target_root, exist_ok=True)
+    try:
+        with zipfile_lib.ZipFile(zip_path, 'r') as zip_ref:
+            for member in zip_ref.infolist():
+                member_path = os.path.realpath(
+                    os.path.join(target_root, member.filename))
+                if member_path != target_root and not member_path.startswith(
+                        target_root + os.sep):
+                    return False, f"压缩包包含非法路径，已拒绝解压: {member.filename}"
+            zip_ref.extractall(target_root)
+    except zipfile_lib.BadZipFile:
+        return False, "无效的ZIP文件"
+    except Exception as e:
+        return False, f"解压失败: {e}"
+    return True, None
+
+
+def locate_ffmpeg_dir(extracted_root, root_dir=None):
+    """在解压结果中定位包含 ffmpeg 可执行文件的目录（bin 目录）
+
+    Returns:
+        str: 目录路径；未找到返回 None
+    """
+    candidates = []
+    if root_dir:
+        candidates.append(os.path.join(extracted_root, root_dir, 'bin'))
+    candidates.append(os.path.join(extracted_root, 'bin'))
+    for candidate in candidates:
+        for exe in FFMPEG_EXE_NAMES:
+            if os.path.exists(os.path.join(candidate, exe)):
+                return candidate
+    return None
+
+
+def verify_ffmpeg(bin_dir, timeout=10):
+    """验证指定 bin 目录下的 ffmpeg 可执行文件可用
+
+    Returns:
+        str: 可执行文件路径；不可用返回 None
+    """
+    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+    for exe in FFMPEG_EXE_NAMES:
+        candidate = os.path.join(bin_dir, exe)
+        if not os.path.exists(candidate):
+            continue
+        try:
+            result = subprocess.run([candidate, '-version'],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    timeout=timeout,
+                                    creationflags=creation_flags)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return candidate
+    return None
+
+
+def install_bin_atomically(source_bin, target_bin, ffmpeg_exe_name='ffmpeg.exe'):
+    """先验证新 bin 可用，再原子替换旧 bin（避免删掉旧版本却没装上新的）
+
+    Returns:
+        tuple: (success: bool, error_msg: str)
+    """
+    if not verify_ffmpeg(source_bin):
+        return False, "解压出的 FFmpeg 无法运行，已保留原有安装"
+
+    backup_bin = target_bin + '.old'
+    if os.path.exists(backup_bin):
+        shutil.rmtree(backup_bin, ignore_errors=True)
+    moved_old = False
+    if os.path.exists(target_bin):
+        try:
+            shutil.move(target_bin, backup_bin)
+            moved_old = True
+        except Exception as e:
+            return False, f"无法替换现有 FFmpeg 目录（可能正在使用）: {e}"
+    try:
+        shutil.move(source_bin, target_bin)
+    except Exception as e:
+        if moved_old and not os.path.exists(target_bin):
+            try:
+                shutil.move(backup_bin, target_bin)  # 回滚
+            except Exception:
+                pass
+        return False, f"安装 FFmpeg 失败: {e}"
+
+    if not verify_ffmpeg(target_bin):
+        return False, "安装后验证失败，已保留原有安装以便回滚"
+    if moved_old:
+        shutil.rmtree(backup_bin, ignore_errors=True)
+    return True, None
+
+
+def probe_chapter_count(m4b_path, ffmpeg_path=None):
+    """用 ffprobe 统计 M4B 中的章节数，用于验证章节信息是否真的写入
+
+    Returns:
+        int: 章节数；无法探测时返回 -1（调用方不应据此判定失败）
+    """
+    candidates = []
+    if ffmpeg_path and os.path.dirname(ffmpeg_path):
+        base = os.path.dirname(ffmpeg_path)
+        for probe_name in FFPROBE_EXE_NAMES:
+            candidates.append(os.path.join(base, probe_name))
+    candidates.extend(FFPROBE_EXE_NAMES)
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+    for probe in candidates:
+        try:
+            result = subprocess.run(
+                [probe, '-v', 'error', '-show_chapters', '-of', 'json', m4b_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=60, creationflags=creation_flags)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode != 0:
+            continue
+        try:
+            payload = json.loads(result.stdout.decode('utf-8', errors='ignore') or '{}')
+        except ValueError:
+            continue
+        return len(payload.get('chapters') or [])
+    return -1
 
 
 async def process_text_to_mp3(text, output_audio, output_lrc, voice, chars_per_line=DEFAULT_CHARS_PER_LINE,
@@ -1215,6 +2130,7 @@ async def process_text_to_mp3(text, output_audio, output_lrc, voice, chars_per_l
             else:
                 print(f"网络连接错误，已达到最大重试次数 ({max_retries})：{e}", file=sys.stderr)
                 traceback.print_exc()
+                _record_tts_failure(e)      # 重试都失败了，这时才记原因
         except IOError as e:
             if attempt < max_retries - 1:
                 print(f"文件IO错误 (第 {attempt + 1}/{max_retries} 次尝试)：{e}", file=sys.stderr)
@@ -1223,6 +2139,7 @@ async def process_text_to_mp3(text, output_audio, output_lrc, voice, chars_per_l
             else:
                 print(f"文件IO错误，已达到最大重试次数 ({max_retries})：{e}", file=sys.stderr)
                 traceback.print_exc()
+                _record_tts_failure(e)
         except Exception as e:
             if attempt < max_retries - 1:
                 print(f"生成音频过程中发生错误 (第 {attempt + 1}/{max_retries} 次尝试)：{e}", file=sys.stderr)
@@ -1231,6 +2148,7 @@ async def process_text_to_mp3(text, output_audio, output_lrc, voice, chars_per_l
             else:
                 print(f"生成音频过程中发生错误，已达到最大重试次数 ({max_retries})：{e}", file=sys.stderr)
                 traceback.print_exc()
+                _record_tts_failure(e)
     return False
 
 
@@ -1294,9 +2212,27 @@ def check_ffmpeg_installed():
     Returns:
         tuple: (is_installed: bool, ffmpeg_path: str)
     """
-    # 首先检查系统PATH中的ffmpeg
+    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+    # 首先检查随包附带的 ffmpeg（打包后无需下载即可导出 M4B）
+    bundled = AppConfig.bundled_ffmpeg_dir()
+    if bundled:
+        for name in ('ffmpeg.exe', 'ffmpeg'):
+            candidate = os.path.join(bundled, name)
+            if os.path.exists(candidate):
+                try:
+                    result = subprocess.run([candidate, '-version'],
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            timeout=5,
+                                            creationflags=creation_flags)
+                    if result.returncode == 0:
+                        return True, candidate
+                except (subprocess.SubprocessError, OSError):
+                    pass
+
+    # 其次检查系统PATH中的ffmpeg
     try:
-        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         result = subprocess.run(['ffmpeg', '-version'], 
                               stdout=subprocess.PIPE, 
                               stderr=subprocess.PIPE,
@@ -1369,51 +2305,43 @@ def install_ffmpeg_from_zip(zip_file_path, progress_callback=None):
         if progress_callback:
             progress_callback(30, 100, "正在解压FFmpeg...")
         
-        # 解压文件
+        # 解压文件（安全解压 + 先验证再原子替换）
         with zipfile_lib.ZipFile(zip_file_path, 'r') as zip_ref:
             # 获取压缩包内的根目录名
             namelist = zip_ref.namelist()
             root_dir = namelist[0].split('/')[0] if '/' in namelist[0] else namelist[0].split('\\')[0]
-            
-            # 解压到独立的临时目录
-            temp_extract = os.path.join(task_temp_dir, 'ffmpeg_extract')
-            if os.path.exists(temp_extract):
-                shutil.rmtree(temp_extract)
-            
-            zip_ref.extractall(temp_extract)
-            
-            if progress_callback:
-                progress_callback(60, 100, "正在安装FFmpeg...")
-            
-            # 查找bin目录
-            source_bin = os.path.join(temp_extract, root_dir, 'bin')
-            if not os.path.exists(source_bin):
-                # 尝试直接查找bin
-                source_bin = os.path.join(temp_extract, 'bin')
-                if not os.path.exists(source_bin):
-                    shutil.rmtree(temp_extract)
-                    return False, None, "ZIP文件中未找到bin目录，请确保是FFmpeg完整包"
-            
-            target_bin = os.path.join(FFMPEG_DIR, 'bin')
-            
-            # 删除旧的bin目录
-            if os.path.exists(target_bin):
-                shutil.rmtree(target_bin)
-            
-            # 移动bin目录到目标位置
-            shutil.move(source_bin, target_bin)
-        
+
+        temp_extract = os.path.join(task_temp_dir, 'ffmpeg_extract')
+        if os.path.exists(temp_extract):
+            shutil.rmtree(temp_extract)
+
+        extract_ok, extract_error = safe_extract_zip(zip_file_path, temp_extract)
+        if not extract_ok:
+            return False, None, extract_error
+
+        if progress_callback:
+            progress_callback(60, 100, "正在安装FFmpeg...")
+
+        source_bin = locate_ffmpeg_dir(temp_extract, root_dir)
+        if not source_bin:
+            return False, None, "ZIP文件中未找到可用的FFmpeg，请确保是完整包"
+
+        target_bin = os.path.join(FFMPEG_DIR, 'bin')
+        install_ok, install_error = install_bin_atomically(source_bin, target_bin)
+        if not install_ok:
+            return False, None, install_error
+
         if progress_callback:
             progress_callback(90, 100, "正在验证安装...")
-        
+
         ffmpeg_exe = os.path.join(FFMPEG_DIR, 'bin', 'ffmpeg.exe')
-        
+
         # 验证安装
         if not os.path.exists(ffmpeg_exe):
             return False, None, "FFmpeg.exe未找到，安装失败"
-        
+
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         try:
-            creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             result = subprocess.run([ffmpeg_exe, '-version'],
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE,
@@ -1476,10 +2404,8 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
             if progress_callback:
                 progress_callback(0, 100, f"正在尝试连接 {mirror_name}...")
             
-            try:
-                # 使用requests库下载（更可靠）
-                import requests
-                
+            # 使用 requests 库下载（更可靠）
+            if requests:
                 # 设置请求头
                 headers = {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -1492,54 +2418,54 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
                 if http_proxy:
                     proxies = {'http': http_proxy, 'https': http_proxy}
                 
-                # 开始下载
-                response = requests.get(download_url, headers=headers, proxies=proxies, stream=True, timeout=DOWNLOAD_TIMEOUT, verify=False)
-                response.raise_for_status()
-                
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded_size = 0
-                
-                if progress_callback:
-                    progress_callback(0, total_size or 100, f"开始下载 ({mirror_name})...")
-                
-                # 写入文件
-                with open(zip_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if cancel_check and cancel_check():
-                            return False, None, "用户取消安装"
-                        
-                        if chunk:
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
+                try:
+                    # 开始下载（保持 TLS 证书校验：下载后会被安装并执行，不能降级）
+                    response = requests.get(download_url, headers=headers, proxies=proxies, stream=True, timeout=DOWNLOAD_TIMEOUT)
+                    response.raise_for_status()
+                    
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded_size = 0
+                    
+                    if progress_callback:
+                        progress_callback(0, total_size or 100, f"开始下载 ({mirror_name})...")
+                    
+                    # 写入文件
+                    with open(zip_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if cancel_check and cancel_check():
+                                return False, None, "用户取消安装"
                             
-                            if progress_callback and total_size > 0:
-                                percent = int((downloaded_size / total_size) * 100)
-                                mb_downloaded = downloaded_size / (1024 * 1024)
-                                mb_total = total_size / (1024 * 1024)
-                                progress_callback(
-                                    downloaded_size, 
-                                    total_size, 
-                                    f"下载中: {percent}% ({mb_downloaded:.1f}/{mb_total:.1f} MB)"
-                                )
-                
-                download_success = True
-                break  # 下载成功，跳出循环
-                
-            except requests.exceptions.Timeout:
-                last_error = f"{mirror_name} 连接超时"
-                if progress_callback:
-                    progress_callback(0, 100, f"{last_error}，尝试下一个源...")
-                time.sleep(1)
-                continue
-                
-            except requests.exceptions.RequestException as e:
-                last_error = f"{mirror_name} 下载失败: {str(e)}"
-                if progress_callback:
-                    progress_callback(0, 100, f"{last_error}，尝试下一个源...")
-                time.sleep(1)
-                continue
-            
-            except ImportError:
+                            if chunk:
+                                f.write(chunk)
+                                downloaded_size += len(chunk)
+                                
+                                if progress_callback and total_size > 0:
+                                    percent = int((downloaded_size / total_size) * 100)
+                                    mb_downloaded = downloaded_size / (1024 * 1024)
+                                    mb_total = total_size / (1024 * 1024)
+                                    progress_callback(
+                                        downloaded_size, 
+                                        total_size, 
+                                        f"下载中: {percent}% ({mb_downloaded:.1f}/{mb_total:.1f} MB)"
+                                    )
+                    
+                    download_success = True
+                    break  # 下载成功，跳出循环
+                    
+                except requests.exceptions.Timeout:
+                    last_error = f"{mirror_name} 连接超时"
+                    if progress_callback:
+                        progress_callback(0, 100, f"{last_error}，尝试下一个源...")
+                    time.sleep(1)
+                    continue
+                    
+                except requests.exceptions.RequestException as e:
+                    last_error = f"{mirror_name} 下载失败: {str(e)}"
+                    if progress_callback:
+                        progress_callback(0, 100, f"{last_error}，尝试下一个源...")
+                    time.sleep(1)
+                    continue
+            else:
                 # 如果没有requests库，回退到urllib
                 if progress_callback:
                     progress_callback(0, 100, f"使用备用下载方式 ({mirror_name})...")
@@ -1560,11 +2486,31 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
                                 f"下载中: {percent}% ({mb_downloaded:.1f}/{mb_total:.1f} MB)"
                             )
                     
-                    # 设置超时
-                    import socket
-                    socket.setdefaulttimeout(DOWNLOAD_TIMEOUT)
-                    
-                    urllib.request.urlretrieve(download_url, zip_path, download_progress)
+                    # 只对本次请求设置超时，不用 socket.setdefaulttimeout
+                    # （后者是进程级全局副作用，会污染其他所有网络调用且不恢复）
+                    opener = urllib.request.build_opener()
+                    opener.addheaders = [('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')]
+                    with opener.open(download_url, timeout=DOWNLOAD_TIMEOUT) as response, \
+                            open(zip_path, 'wb') as out_file:
+                        total_size = int(response.headers.get('content-length') or 0)
+                        downloaded = 0
+                        while True:
+                            if cancel_check and cancel_check():
+                                return False, None, "用户取消安装"
+                            block = response.read(64 * 1024)
+                            if not block:
+                                break
+                            out_file.write(block)
+                            downloaded += len(block)
+                            if progress_callback and total_size > 0:
+                                percent = min(int(downloaded / total_size * 100), 100)
+                                progress_callback(
+                                    downloaded,
+                                    total_size,
+                                    f"下载中: {percent}% "
+                                    f"({downloaded / 1048576:.1f}/"
+                                    f"{total_size / 1048576:.1f} MB)"
+                                )
                     download_success = True
                     break
                     
@@ -1587,27 +2533,30 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
         if not os.path.exists(zip_path) or os.path.getsize(zip_path) < 1024 * 1024:  # 小于1MB可能有问题
             return False, None, "下载的文件不完整或损坏"
         
-        # 解压文件
+        # 解压文件（安全解压 + 先验证再原子替换）
         with zipfile_lib.ZipFile(zip_path, 'r') as zip_ref:
             # 获取压缩包内的根目录名
             namelist = zip_ref.namelist()
             root_dir = namelist[0].split('/')[0] if '/' in namelist[0] else namelist[0].split('\\')[0]
-            
-            # 解压到临时目录
-            temp_extract = os.path.join(task_temp_dir, 'ffmpeg_extract')
-            zip_ref.extractall(temp_extract)
-            
-            # 移动bin目录到目标位置
-            source_bin = os.path.join(temp_extract, root_dir, 'bin')
-            target_bin = os.path.join(FFMPEG_DIR, 'bin')
-            
-            if os.path.exists(target_bin):
-                shutil.rmtree(target_bin)
-            
-            shutil.move(source_bin, target_bin)
-            
-            # 清理临时文件
-            shutil.rmtree(temp_extract)
+
+        # 解压到临时目录
+        temp_extract = os.path.join(task_temp_dir, 'ffmpeg_extract')
+        extract_ok, extract_error = safe_extract_zip(zip_path, temp_extract)
+        if not extract_ok:
+            return False, None, extract_error
+
+        # 定位并原子替换 bin 目录
+        source_bin = locate_ffmpeg_dir(temp_extract, root_dir)
+        if not source_bin:
+            return False, None, "下载包中未找到可用的FFmpeg，请重试或手动安装"
+
+        target_bin = os.path.join(FFMPEG_DIR, 'bin')
+        install_ok, install_error = install_bin_atomically(source_bin, target_bin)
+        if not install_ok:
+            return False, None, install_error
+
+        # 清理临时文件
+        shutil.rmtree(temp_extract, ignore_errors=True)
         
         os.remove(zip_path)
         
@@ -1617,8 +2566,8 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
         ffmpeg_exe = os.path.join(FFMPEG_DIR, 'bin', 'ffmpeg.exe')
         
         # 验证安装
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         try:
-            creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             result = subprocess.run([ffmpeg_exe, '-version'],
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE,
@@ -1631,7 +2580,7 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
         except Exception as e:
             return False, None, f"FFmpeg验证失败: {str(e)}"
     
-    except urllib.error.URLError as e:
+    except URLError as e:
         return False, None, f"下载失败: 无法连接到下载服务器 ({str(e)})"
     except Exception as e:
         return False, None, f"安装失败: {str(e)}"
@@ -1644,7 +2593,8 @@ def download_ffmpeg(progress_callback=None, cancel_check=None):
             print(f"清理临时目录失败: {e}")
 
 
-def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_path=None, chapter_titles=None):
+def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_path=None,
+                     chapter_titles=None, cancel_check=None):
     """将多个MP3文件合并为M4B有声书格式，并嵌入章节信息
     
     Args:
@@ -1692,6 +2642,8 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
         print("正在获取章节时长...") 
         chapter_durations = []
         for mp3_file in mp3_files:
+            if cancel_check and cancel_check():
+                return False, "用户取消合并"
             duration = None
             
             # 方案1: 使用FFmpeg获取时长
@@ -1717,7 +2669,7 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             except Exception as e:
                 print(f"FFmpeg获取 {os.path.basename(mp3_file)} 时长失败: {e}")
             
-            # 方案2: 如果FFmpeg失败，使用mutagen作为备用方案
+            # 方案2: FFmpeg 失败时用 mutagen
             if duration is None or duration <= 0:
                 try:
                     audio = MP3(mp3_file)
@@ -1726,12 +2678,22 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
                         print(f"Mutagen获取 {os.path.basename(mp3_file)} 时长: {duration:.2f}秒")
                 except Exception as e:
                     print(f"Mutagen获取 {os.path.basename(mp3_file)} 时长失败: {e}")
-            
-            # 最终处理: 如果两种方法都失败，使用最小时长1秒
+
+            # 方案3: 都用不了时，用自带 MPEG 帧解析（不依赖任何第三方库）。
+            # 直接兜底成 1 秒会让章节表整体错位，这里必须尽量拿到真实时长。
+            if duration is None or duration <= 0:
+                parsed_ms = mp3_duration_ms(mp3_file)
+                if parsed_ms > 0:
+                    duration = parsed_ms / 1000.0
+                    print(f"MPEG解析获取 {os.path.basename(mp3_file)} 时长: {duration:.2f}秒")
+
+            # 最终兜底: 仍然拿不到才用最小时长，并明确告警
             if duration is None or duration <= 0:
                 duration = 1.0
-                print(f"警告: 无法获取 {os.path.basename(mp3_file)} 的时长，使用最小时长1秒")
-            
+                print(f"警告: 无法获取 {os.path.basename(mp3_file)} 的时长，"
+                      f"章节表将使用最小时长1秒（可能导致章节定位不准）",
+                      file=sys.stderr)
+
             chapter_durations.append(duration)
         
         # 创建临时文件列表
@@ -1779,6 +2741,8 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
         temp_m4a = os.path.join(task_temp_dir, "temp_audiobook.m4a")
         
         # 第一步：合并所有MP3为M4A，并嵌入章节信息
+        if cancel_check and cancel_check():
+            return False, "用户取消合并"
         print("正在合并音频文件并添加章节信息...")
         concat_cmd = [
             ffmpeg_path,
@@ -1786,7 +2750,9 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             "-safe", "0",
             "-i", list_file,
             "-i", metadata_file,  # 添加章节元数据
-            "-map_metadata", "1",  # 使用metadata_file的元数据
+            "-map", "0:a",
+            "-map_metadata", "1",   # 使用metadata_file的全局元数据
+            "-map_chapters", "1",   # 关键：显式要求写入章节表，否则 0:t 可能不存在
             "-c:a", "aac",
             "-b:a", "64k",
             "-ar", "44100",
@@ -1799,11 +2765,21 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
                               stderr=subprocess.PIPE,
                               creationflags=creation_flags)
         
+        result_err = result.stderr.decode('utf-8', errors='ignore')
         if result.returncode != 0:
-            error_output = result.stderr.decode('utf-8', errors='ignore')
-            error_msg = f"FFmpeg合并音频失败\n错误代码: {result.returncode}\n详细信息: {error_output[-500:]}"
-            print(f"FFmpeg合并失败: {error_output}", file=sys.stderr)
-            return False, error_msg
+            # 回退：部分 FFmpeg 构建对 -map_chapters 支持不佳，去掉它重试一次
+            print("章节映射失败，去掉 -map_chapters 重试...", file=sys.stderr)
+            fallback_cmd = [c for c in concat_cmd if c not in ("-map_chapters", "1")]
+            result = subprocess.run(fallback_cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    creationflags=creation_flags)
+            result_err = result.stderr.decode('utf-8', errors='ignore')
+            if result.returncode != 0:
+                error_msg = (f"FFmpeg合并音频失败\n错误代码: {result.returncode}\n"
+                             f"详细信息: {result_err[-500:]}")
+                print(f"FFmpeg合并失败: {result_err}", file=sys.stderr)
+                return False, error_msg
         
         # 第二步：添加封面，转换为M4B
         print("正在添加封面...")
@@ -1813,10 +2789,15 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             "-i", temp_m4a,
         ]
         
-        # 如果有封面，添加封面输入
+        # 如果有封面，添加封面输入（扩展名按文件头判断，避免 PNG 被当作 JPEG）
         cover_file = None
         if cover_data:
-            cover_file = os.path.join(task_temp_dir, "m4b_cover.jpg")
+            cover_ext = '.jpg'
+            if cover_data.startswith(b'\x89PNG'):
+                cover_ext = '.png'
+            elif cover_data.startswith(b'GIF8'):
+                cover_ext = '.gif'
+            cover_file = os.path.join(task_temp_dir, "m4b_cover" + cover_ext)
             with open(cover_file, 'wb') as f:
                 f.write(cover_data)
             metadata_cmd.extend(["-i", cover_file])
@@ -1830,24 +2811,27 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             metadata_cmd.extend([
                 "-c:v", "copy",
                 "-map", "0:a",
-                "-map", "0:t?",  # 映射章节信息
+                "-map", "0:t?",   # 映射章节信息（第二步必须显式保留）
                 "-map", "1:v",
                 "-disposition:v:0", "attached_pic",  # 设置封面为附加图片
             ])
         else:
             metadata_cmd.extend([
                 "-map", "0:a",
-                "-map", "0:t?",  # 映射章节信息
+                "-map", "0:t?",   # 映射章节信息
             ])
         
         # 添加元数据（保持原有章节信息）
         metadata_cmd.extend([
+            "-map_chapters", "0",  # 关键：不要丢弃第一步写入的章节表
             "-metadata", "media_type=2",  # 2表示有声书
             "-f", "mp4",
             "-y",
             output_m4b
         ])
         
+        if cancel_check and cancel_check():
+            return False, "用户取消合并"
         result = subprocess.run(metadata_cmd,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,
@@ -1859,7 +2843,18 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             print(f"FFmpeg添加元数据失败: {error_output}", file=sys.stderr)
             return False, error_msg
         
-        print(f"M4B文件生成成功: {output_m4b}")
+        # 第三步：验证章节是否真的写进去了（章节表丢失是静默失败）
+        expected_chapters = len(mp3_files)
+        actual_chapters = probe_chapter_count(output_m4b, ffmpeg_path)
+        if actual_chapters >= 0 and actual_chapters != expected_chapters:
+            warning = (f"章节信息写入异常：期望 {expected_chapters} 章，"
+                       f"实际 {actual_chapters} 章")
+            print(f"警告: {warning}", file=sys.stderr)
+            if actual_chapters == 0:
+                return False, f"{warning}。请更换 FFmpeg 构建后重试。"
+        
+        print(f"M4B文件生成成功: {output_m4b}（章节数 {actual_chapters}/"
+              f"{expected_chapters}）")
         return True, None
         
     except Exception as e:
@@ -1876,45 +2871,397 @@ def merge_mp3_to_m4b(mp3_files, output_m4b, metadata, cover_data=None, ffmpeg_pa
             print(f"清理临时目录失败: {e}")
 
 
-# ===== 主GUI应用 =====
+# ===== 界面主题 =====
+class UITheme:
+    """集中管理界面配色与字体，避免样式散落在各处"""
+
+    # 中性色
+    BG = '#f4f6f9'          # 窗口底色
+    SURFACE = '#ffffff'     # 卡片/输入框
+    BORDER = '#d8dee7'
+    HOVER = '#eef2f7'
+
+    # 文本
+    TEXT = '#1f2933'
+    MUTED = '#6b7684'
+
+    # 主题色
+    ACCENT = '#2f6feb'
+    ACCENT_DARK = '#2559c4'
+    ACCENT_SOFT = '#e8f0fe'
+    OK = '#137a4c'
+    WARN = '#a15c00'
+    ERROR = '#b42318'
+
+    # 阅读区
+    READ_BG = '#f7f9fc'
+
+    FONT_FAMILY = 'Microsoft YaHei UI'
+    BASE_FAMILY = 'Microsoft YaHei'
+
+
+def apply_theme(root):
+    """应用 ttk 主题与全局样式
+
+    Windows 原生 'vista' 主题不支持自定义背景/边框，因此统一改用 'clam' 后手工调色。
+    """
+    theme = UITheme
+    style = ttk.Style(root)
+    try:
+        style.theme_use('clam')
+    except tk.TclError:
+        pass
+
+    style.configure('.',
+                    background=theme.BG,
+                    foreground=theme.TEXT,
+                    font=(theme.FONT_FAMILY, 10),
+                    focuscolor=theme.ACCENT)
+    style.configure('TFrame', background=theme.BG)
+    style.configure('Card.TFrame', background=theme.SURFACE,
+                    relief='solid', borderwidth=1)
+    style.configure('Toolbar.TFrame', background=theme.SURFACE,
+                    relief='solid', borderwidth=1)
+    style.configure('Header.TFrame', background=theme.SURFACE)
+    style.configure('Status.TFrame', background=theme.SURFACE,
+                    relief='solid', borderwidth=1)
+
+    style.configure('TLabel', background=theme.BG, foreground=theme.TEXT)
+    style.configure('Surface.TLabel', background=theme.SURFACE, foreground=theme.TEXT)
+    style.configure('Muted.TLabel', background=theme.BG, foreground=theme.MUTED,
+                    font=(theme.FONT_FAMILY, 9))
+    style.configure('SurfaceMuted.TLabel', background=theme.SURFACE,
+                    foreground=theme.MUTED, font=(theme.FONT_FAMILY, 9))
+    style.configure('HeaderTitle.TLabel', background=theme.SURFACE,
+                    foreground=theme.TEXT, font=(theme.FONT_FAMILY, 11, 'bold'))
+    style.configure('Title.TLabel', background=theme.BG, foreground=theme.TEXT,
+                    font=(theme.FONT_FAMILY, 12, 'bold'))
+    style.configure('InfoKey.TLabel', background=theme.SURFACE,
+                    foreground=theme.MUTED, font=(theme.FONT_FAMILY, 9))
+    style.configure('InfoValue.TLabel', background=theme.SURFACE,
+                    foreground=theme.TEXT, font=(theme.FONT_FAMILY, 10))
+    style.configure('Status.TLabel', background=theme.SURFACE,
+                    foreground=theme.MUTED, font=(theme.FONT_FAMILY, 9))
+
+    # 卡片式容器
+    style.configure('TLabelframe', background=theme.BG,
+                    bordercolor=theme.BORDER, relief='solid', borderwidth=1)
+    style.configure('TLabelframe.Label', background=theme.BG,
+                    foreground=theme.TEXT, font=(theme.FONT_FAMILY, 10, 'bold'))
+    style.configure('Card.TLabelframe', background=theme.SURFACE,
+                    bordercolor=theme.BORDER, relief='solid', borderwidth=1)
+    style.configure('Card.TLabelframe.Label', background=theme.SURFACE,
+                    foreground=theme.MUTED, font=(theme.FONT_FAMILY, 9, 'bold'))
+
+    # 按钮
+    style.configure('TButton', background=theme.SURFACE, foreground=theme.TEXT,
+                    bordercolor=theme.BORDER, focuscolor=theme.SURFACE,
+                    relief='flat', padding=(12, 6), font=(theme.FONT_FAMILY, 10))
+    style.map('TButton',
+              background=[('pressed', theme.HOVER), ('active', theme.HOVER),
+                          ('disabled', '#f2f4f7')],
+              foreground=[('disabled', '#a3acb9')],
+              bordercolor=[('active', theme.ACCENT)])
+
+    style.configure('Accent.TButton', background=theme.ACCENT,
+                    foreground='#ffffff', bordercolor=theme.ACCENT,
+                    relief='flat', padding=(14, 7),
+                    font=(theme.FONT_FAMILY, 10, 'bold'))
+    style.map('Accent.TButton',
+              background=[('pressed', theme.ACCENT_DARK), ('active', theme.ACCENT_DARK),
+                          ('disabled', '#b9c8e8')],
+              foreground=[('disabled', '#f0f4ff')],
+              bordercolor=[('disabled', '#b9c8e8')])
+
+    style.configure('Ghost.TButton', background=theme.BG, bordercolor=theme.BG,
+                    relief='flat', padding=(8, 4),
+                    font=(theme.FONT_FAMILY, 9))
+    style.map('Ghost.TButton',
+              background=[('active', theme.HOVER)],
+              foreground=[('active', theme.ACCENT)])
+
+    style.configure('TEntry', fieldbackground=theme.SURFACE,
+                    bordercolor=theme.BORDER, lightcolor=theme.BORDER,
+                    darkcolor=theme.BORDER, padding=5)
+    style.configure('TCombobox', fieldbackground=theme.SURFACE,
+                    background=theme.SURFACE, bordercolor=theme.BORDER,
+                    arrowcolor=theme.MUTED, padding=4)
+    style.map('TCombobox',
+              fieldbackground=[('readonly', theme.SURFACE)],
+              bordercolor=[('focus', theme.ACCENT), ('hover', theme.ACCENT)])
+    style.configure('TSpinbox', fieldbackground=theme.SURFACE,
+                    bordercolor=theme.BORDER, arrowcolor=theme.MUTED, padding=4)
+
+    style.configure('TNotebook', background=theme.BG, bordercolor=theme.BG,
+                    tabmargins=(0, 4, 0, 0))
+    style.configure('TNotebook.Tab', background=theme.BG, foreground=theme.MUTED,
+                    padding=(20, 9), font=(theme.FONT_FAMILY, 10))
+    style.map('TNotebook.Tab',
+              background=[('selected', theme.SURFACE)],
+              foreground=[('selected', theme.ACCENT)],
+              font=[('selected', (theme.FONT_FAMILY, 10, 'bold'))])
+
+    style.configure('TRadiobutton', background=theme.BG, foreground=theme.TEXT)
+    style.map('TRadiobutton', background=[('active', theme.BG)])
+    style.configure('TCheckbutton', background=theme.BG, foreground=theme.TEXT)
+
+    style.configure('TProgressbar', background=theme.ACCENT,
+                    troughcolor='#e3e8f0', bordercolor=theme.SURFACE,
+                    lightcolor=theme.ACCENT, darkcolor=theme.ACCENT,
+                    thickness=8)
+    style.configure('Vertical.TScrollbar', background=theme.HOVER,
+                    troughcolor=theme.BG, bordercolor=theme.BG,
+                    arrowcolor=theme.MUTED, relief='flat')
+    style.configure('Horizontal.TScrollbar', background=theme.HOVER,
+                    troughcolor=theme.BG, bordercolor=theme.BG,
+                    arrowcolor=theme.MUTED, relief='flat')
+
+    return style
+
+
 class EpubToMp3App:
     def __init__(self, root):
         self.root = root
-        self.root.title("epubReader V0.01")
-        self.root.geometry("1024x700")
+        self.root.title("epubReader · EPUB 有声书制作")
+        self.MIN_WINDOW_HEIGHT = 700
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        width = min(1180, int(screen_w * 0.86))
+        height = min(885, int(screen_h * 0.92))
+        self.root.geometry('%dx%d' % (width, height))
+        self.root.minsize(min(1000, width), min(self.MIN_WINDOW_HEIGHT, height))
+        self.root.configure(background=UITheme.BG)
+
+        # 应用主题（必须在创建控件之前）
+        self.style = apply_theme(self.root)
 
         # 存储解析后的数据
         self.epub_data = None
         self.current_chapter_index = -1  # -1 表示没有章节被选中
         self.processing = False  # 标记是否有转换任务正在进行
+        self.processing_lock = threading.Lock()  # 保护 processing 的检查与置位
         self.failed_chapters = []  # 记录失败的章节 [{"index": int, "title": str, "reason": str}]
+        self.failed_chapters_lock = threading.Lock()  # 保护失败章节列表
         self.estimated_time_var = None  # 将在create_widgets中初始化
         self.estimated_time_var_epub_tab = None  # 将在create_widgets中初始化
         self.ffmpeg_path = None  # FFmpeg路径
         self.ffmpeg_installed = False  # FFmpeg安装状态
 
-        # 创建临时目录
-        os.makedirs(TEMP_DIR, exist_ok=True)
+        # 实例级临时目录：不再使用所有实例共享的 TEMP_DIR，
+        # 否则两个实例同时运行会互相删除对方的临时文件
+        self.session_temp_dir = tempfile.mkdtemp(
+            prefix='epubReader_%d_' % os.getpid())
+        self._session_temp_counter = 0
+        self._session_temp_lock = threading.Lock()
+        # M4B 合并的中止信号（"中止合并"按钮会置位）
+        self._m4b_cancel_event = threading.Event()
+        atexit.register(self.cleanup_session_temp_dir)
+
+        # 设置持久化（损坏/缺失时自动使用默认值）
+        self.config_store = ConfigStore()
+        self._stopping = False  # 关闭时停止消息泵续期
+
+        # 日志：在应用初始化时就建立，保证无论从哪个入口启动都有日志可查
+        self.logger = setup_logging()
+        self.logger.info("界面初始化，临时目录: %s", self.session_temp_dir)
+        self.write_debug_report()
+
+        # Tk 回调里的异常默认只打到 stderr，窗口模式下等于丢失；
+        # 注意 sys.excepthook 管不到这条路径，必须单独接管。
+        self.root.report_callback_exception = self._report_callback_exception
 
         # 创建通信队列（仍然用于GUI更新）
         self.message_queue = queue.Queue()
         
-        # *** 创建统一的任务调度器 ***
-        self.task_scheduler = TaskScheduler(max_concurrent_tts=3)
+        # *** 创建统一的任务调度器（并发上限 = 工作线程数） ***
+        self.task_scheduler = TaskScheduler(max_workers=3)
         self.task_scheduler.start()
 
-        # 创建基本字体
-        self.base_font = font.Font(family='Microsoft YaHei', size=11)
-        self.small_font = font.Font(family='Microsoft YaHei', size=9)
+        # 字体（阅读区用 10.5pt，界面用 9pt）
+        self.base_font = font.Font(family=UITheme.BASE_FAMILY, size=11)
+        self.read_font = font.Font(family=UITheme.BASE_FAMILY, size=11)
+        self.small_font = font.Font(family=UITheme.FONT_FAMILY, size=9)
+        self.ui_font = font.Font(family=UITheme.FONT_FAMILY, size=10)
 
         # 创建主界面
         self.create_widgets()
+
+        # 恢复上次的设置（缺失/损坏时静默使用默认值）
+        self._load_persisted_settings()
 
         # 检查FFmpeg
         self.root.after(500, self.check_ffmpeg_on_startup)
 
         # 启动消息处理
         self.process_messages()
+
+    def _report_callback_exception(self, exc_type, exc_value, exc_tb):
+        """把 Tk 回调里的异常写进应用日志
+
+        sys.excepthook 只在解释器顶层异常时触发，Tk 回调走的是
+        root.report_callback_exception，两回事。窗口模式（打包后）没有 stderr，
+        不接管这里的话界面回调出错时用户和日志都看不到任何线索。
+        """
+        text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(text, file=sys.stderr)
+        try:
+            self.logger.error("界面回调异常\n%s", text)
+        except Exception:
+            pass
+
+    def write_debug_report(self):
+        """当设置 EPUBREADER_DEBUG=1 时，写一份运行环境报告（便于排查打包后的问题）
+
+        Windows 上是窗口程序，默认没有控制台，出问题时看不到任何输出；
+        这个文件能回答"用的哪个 ffmpeg / 日志写到哪里 / 临时目录在哪"。
+        """
+        if os.environ.get('EPUBREADER_DEBUG') != '1':
+            return
+        try:
+            lines = [
+                'epubReader 调试报告',
+                '时间: %s' % datetime.now().isoformat(),
+                'frozen(是否打包): %s' % bool(getattr(sys, 'frozen', False)),
+                'MEIPASS: %s' % getattr(sys, '_MEIPASS', None),
+                '可执行文件: %s' % sys.executable,
+                '工作目录: %s' % os.getcwd(),
+                'APPDATA: %s' % os.environ.get('APPDATA'),
+                '配置目录: %s' % AppConfig.CONFIG_DIR,
+                '日志文件: %s' % AppConfig.LOG_PATH,
+                '日志存在: %s' % os.path.exists(AppConfig.LOG_PATH),
+                '临时目录: %s' % self.session_temp_dir,
+                '随包 ffmpeg: %s' % AppConfig.bundled_ffmpeg_dir(),
+                '检测到的 ffmpeg: %s' % (self.ffmpeg_path,),
+            ]
+            logger = self.logger
+            if logger is not None:
+                lines.append('logger handlers: %s' % [
+                    type(h).__name__ for h in logger.handlers])
+            target = os.path.join(os.path.expanduser('~'), 'epubReader_debug.txt')
+            with io.open(target, 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join(lines) + '\n')
+        except Exception as exc:
+            print('写调试报告失败: %s' % exc, file=sys.stderr)
+
+    def _collect_settings(self):
+        """收集需要持久化的界面设置"""
+        try:
+            return {
+                'tts_engine': self.tts_engine_var.get(),
+                'voice': self.voice_var.get(),
+                'chars_per_line': int(self.chars_per_line_var.get()),
+                'output_format': self.output_format_var.get(),
+                'concurrent_threads': int(self.concurrent_threads_var.get()),
+                'output_dir': self.output_dir_var.get(),
+                'album': self.album_var.get(),
+                'artist': self.artist_var.get(),
+            }
+        except Exception as e:
+            print(f"收集设置失败: {e}", file=sys.stderr)
+            return {}
+
+    def _load_persisted_settings(self):
+        """把持久化的设置写回界面控件"""
+        if self.config_store is None:
+            return
+        data = self.config_store.data
+        try:
+            if data.get('tts_engine'):
+                self.tts_engine_var.set(data['tts_engine'])
+                self.update_voice_list()
+            if data.get('voice'):
+                self.voice_var.set(data['voice'])
+            if data.get('chars_per_line'):
+                self.chars_per_line_var.set(int(data['chars_per_line']))
+            if data.get('concurrent_threads'):
+                self.concurrent_threads_var.set(int(data['concurrent_threads']))
+            if data.get('output_format') in ('MP3', 'M4B'):
+                self.output_format_var.set(data['output_format'])
+            if data.get('output_dir') and os.path.isdir(data['output_dir']):
+                self.output_dir_var.set(data['output_dir'])
+            if data.get('album'):
+                self.album_var.set(data['album'])
+            if data.get('artist'):
+                self.artist_var.set(data['artist'])
+        except Exception as e:
+            print(f"恢复设置失败（使用默认值）: {e}", file=sys.stderr)
+
+    def save_settings(self):
+        """保存界面设置（退出/开始任务时调用）
+
+        采集控件值这一步要先于写盘、且单独兜住 `tk.TclError`：窗口已经销毁时
+        （典型是"初始化还没走完就被关掉"）`StringVar.get()` 会抛 TclError，
+        若直接冒出去就整条保存流程失败、配置一点都没落盘。此时退化成
+        "把内存里已有的配置写下来"，比丢失全部设置好。
+        """
+        if self.config_store is None:
+            return
+        try:
+            self.config_store.update(**self._collect_settings())
+        except tk.TclError:
+            self.logger.warning("读取控件设置失败（窗口可能已销毁），改为落盘已有配置")
+        self.config_store.save()
+
+    def try_begin_processing(self):
+        """尝试进入“处理中”状态（线程安全，防止并发任务互相覆盖输出文件）
+
+        Returns:
+            bool: True 表示获取成功；False 表示已有任务在运行
+        """
+        with self.processing_lock:
+            if self.processing:
+                return False
+            self.processing = True
+            return True
+
+    def end_processing(self):
+        """退出“处理中”状态（线程安全）"""
+        with self.processing_lock:
+            self.processing = False
+
+    def new_temp_path(self, suffix='', prefix='tmp'):
+        """在实例级临时目录下分配一个唯一路径（替代已弃用的 mktemp）
+
+        使用 mkstemp 保证原子性，避免 TOCTOU 竞争；文件已创建，调用方可直接使用。
+        """
+        os.makedirs(self.session_temp_dir, exist_ok=True)
+        descriptor, path = tempfile.mkstemp(
+            suffix=suffix, prefix=prefix + '_', dir=self.session_temp_dir)
+        os.close(descriptor)
+        return path
+
+    def temp_subdir(self, prefix):
+        """在实例级临时目录下创建子目录（用于多文件任务）"""
+        with self._session_temp_lock:
+            self._session_temp_counter += 1
+            index = self._session_temp_counter
+        path = os.path.join(self.session_temp_dir, '%s_%d' % (prefix, index))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def cleanup_session_temp_dir(self):
+        """清理本实例的临时目录（容错：文件占用不抛异常）"""
+        path = getattr(self, 'session_temp_dir', None)
+        if not path or not os.path.isdir(path):
+            return
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception as e:
+            print(f"清理临时目录失败（可忽略）: {e}", file=sys.stderr)
+
+    def submit_scheduler_task(self, task):
+        """提交任务到调度器，失败时给出可读提示而不是抛栈
+
+        Returns:
+            bool: 是否成功提交
+        """
+        try:
+            self.task_scheduler.submit_task(task)
+            return True
+        except RuntimeError as e:
+            messagebox.showerror("无法提交任务", str(e))
+            self.update_status(f"任务提交失败: {e}")
+            return False
 
     def center_window(self):
         """将窗口居中显示"""
@@ -1934,16 +3281,15 @@ class EpubToMp3App:
 
         # 创建主标签页容器
         self.notebook = ttk.Notebook(self.root)
-        # 使用grid替代pack，放在第0行
-        self.notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=5)
+        self.notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
 
         # 创建EPUB阅读与编辑页
         self.epub_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.epub_frame, text="浏览与编辑")
+        self.notebook.add(self.epub_frame, text="  浏览与编辑  ")
 
         # 创建设置与自定义
         self.mp3_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.mp3_frame, text="设置与自定义")
+        self.notebook.add(self.mp3_frame, text="  设置与自定义  ")
 
         # 底部状态栏
         self.create_status_bar()
@@ -1954,240 +3300,241 @@ class EpubToMp3App:
         # 初始化有声书转换界面
         self.create_mp3_converter_ui()
 
+    def _update_chapter_count(self):
+        """刷新章节计数（列表头右侧）"""
+        label = getattr(self, 'chapter_count_label', None)
+        if label is None:
+            return
+        total = len(self.epub_data['chapters']) if (
+            self.epub_data and self.epub_data.get('chapters')) else 0
+        label.config(text=('共 %d 章' % total) if total else '未载入')
+
     def create_status_bar(self):
         """创建底部状态栏"""
-        status_frame = ttk.Frame(self.root)
-        # 使用grid替代pack，放在第1行
-        status_frame.grid(row=1, column=0, sticky="ew")
+        theme = UITheme
+        status_frame = ttk.Frame(self.root, style='Status.TFrame',
+                                 padding=(14, 6))
+        status_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        status_frame.columnconfigure(1, weight=1)
+        status_frame.columnconfigure(2, weight=0)
 
-        # 配置status_frame的列权重，使状态标签可以扩展
-        status_frame.columnconfigure(0, weight=1)  # 状态标签可扩展
-        status_frame.columnconfigure(1, weight=0)  # 进度条固定宽度
+        ttk.Label(status_frame, text="状态", style='SurfaceMuted.TLabel',
+                  font=(theme.FONT_FAMILY, 9, 'bold')).grid(
+            row=0, column=0, padx=(0, 10))
 
         self.status_label = ttk.Label(
-            status_frame,
-            text="状态: 等待操作...",
-            relief=tk.SUNKEN,
-            anchor=tk.W,
-            font=self.small_font
-        )
-        # 使用grid替代pack，放在第0列
-        self.status_label.grid(row=0, column=0, sticky="ew", padx=5, pady=2)
+            status_frame, text="等待操作…", anchor=tk.W,
+            style='Status.TLabel')
+        self.status_label.grid(row=0, column=1, sticky="ew")
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
-            status_frame,
-            orient=tk.HORIZONTAL,
-            length=200,
-            mode='determinate',
-            variable=self.progress_var
-        )
-        # 使用grid替代pack，放在第1列
-        self.progress_bar.grid(row=0, column=1, padx=5, pady=2)
+            status_frame, orient=tk.HORIZONTAL, length=240,
+            mode='determinate', variable=self.progress_var)
+        self.progress_bar.grid(row=0, column=2, padx=(12, 0))
         self.progress_bar["maximum"] = 100
         self.progress_bar["value"] = 0
 
     def create_epub_reader_ui(self):
         """创建EPUB阅读与编辑UI"""
-        # 顶部工具栏
-        top_frame = ttk.Frame(self.epub_frame)
-        top_frame.pack(fill=tk.X, padx=5, pady=5)
+        theme = UITheme
 
-        # 选择电子书按钮
+        # ---------- 顶部工具栏 ----------
+        top_frame = ttk.Frame(self.epub_frame, style='Toolbar.TFrame',
+                              padding=(12, 10))
+        top_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+        top_frame.columnconfigure(2, weight=1)
+
         self.select_button = ttk.Button(
-            top_frame,
-            text="选择电子书",
-            command=self.select_epub_file
-        )
-        self.select_button.pack(side=tk.LEFT, padx=(0, 5))
+            top_frame, text="选择电子书", command=self.select_epub_file,
+            style='Accent.TButton')
+        self.select_button.grid(row=0, column=0, padx=(0, 10))
 
-        # 文件路径输入框
+        ttk.Label(top_frame, text="文件", style='SurfaceMuted.TLabel').grid(
+            row=0, column=1, padx=(0, 6))
+
         self.filepath_var = tk.StringVar()
         self.filepath_entry = ttk.Entry(
-            top_frame,
-            textvariable=self.filepath_var,
-            state='readonly',
-            width=40
-        )
-        self.filepath_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+            top_frame, textvariable=self.filepath_var, state='readonly')
+        self.filepath_entry.grid(row=0, column=2, sticky='ew', padx=(0, 10))
 
-        # # 导出所有章节为TXT（注释掉）
-        # self.export_all_button = ttk.Button(
-        #     top_frame,
-        #     text="导出所有章节",
-        #     command=self.export_all_chapters,
-        #     state="disabled"
-        # )
-        # self.export_all_button.pack(side=tk.LEFT, padx=(0, 5))
-
-        # 新增"显示预计耗时"标签
-        self.estimated_time_var_epub_tab = tk.StringVar(value="预计耗时：00:00:00")
+        self.estimated_time_var_epub_tab = tk.StringVar(value="预计耗时 00:00:00")
         self.estimated_time_label_epub_tab = ttk.Label(
-            top_frame,
-            textvariable=self.estimated_time_var_epub_tab,
-            font=self.small_font
-        )
-        self.estimated_time_label_epub_tab.pack(side=tk.LEFT, padx=(0, 5))
+            top_frame, textvariable=self.estimated_time_var_epub_tab,
+            style='SurfaceMuted.TLabel')
+        self.estimated_time_label_epub_tab.grid(row=0, column=3, padx=(0, 10))
 
-        # 新增"生成电子书"按钮
         self.generate_ebook_button_epub_tab = ttk.Button(
-            top_frame,
-            text="生成电子书",
-            command=self.start_generate_ebook,
-            state="disabled"
-        )
-        self.generate_ebook_button_epub_tab.pack(side=tk.LEFT, padx=(0, 5))
+            top_frame, text="生成有声书", command=self.start_generate_ebook,
+            state="disabled", style='Accent.TButton')
+        self.generate_ebook_button_epub_tab.grid(row=0, column=4, padx=(0, 8))
 
-        # 批量导出TXT按钮
         self.export_all_button = ttk.Button(
-            top_frame,
-            text="批量导出TXT",
-            command=self.export_all_chapters,
-            state="disabled"
-        )
-        self.export_all_button.pack(side=tk.LEFT, padx=(0, 5))
+            top_frame, text="批量导出 TXT", command=self.export_all_chapters,
+            state="disabled")
+        self.export_all_button.grid(row=0, column=5)
 
-        # 主工作区 - 使用PanedWindow
+        # ---------- 主工作区 ----------
         main_pane = ttk.PanedWindow(self.epub_frame, orient=tk.HORIZONTAL)
-        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        # 左侧信息区域
-        left_frame = ttk.Frame(main_pane, width=220)
-        left_frame.pack_propagate(False)  # 防止frame根据内容自动缩放
-        main_pane.add(left_frame, weight=20)
+        # ===== 左：封面 + 书籍信息 =====
+        left_frame = ttk.Frame(main_pane, width=250)
+        left_frame.pack_propagate(False)
+        main_pane.add(left_frame, weight=0)
 
-        # 封面图片区域
-        self.cover_label = ttk.Label(left_frame, text="图书封面", anchor=tk.CENTER, background="#f0f0f0")
-        self.cover_label.pack(fill=tk.X, padx=5, pady=5)
-        self.cover_label.configure(width=220)
+        self.cover_label = tk.Label(
+            left_frame, text="图书封面", anchor=tk.CENTER,
+            background=theme.ACCENT_SOFT, foreground=theme.MUTED,
+            font=(theme.FONT_FAMILY, 10), padx=8, pady=8)
+        self.cover_label.pack(fill=tk.X, padx=(0, 10), pady=(0, 8))
 
-        # 书籍信息
-        info_frame = ttk.LabelFrame(left_frame, text="书籍信息")
-        info_frame.pack(fill=tk.X, padx=5, pady=5)
+        info_card = ttk.Frame(left_frame, style='Card.TFrame', padding=(14, 12))
+        info_card.pack(fill=tk.BOTH, expand=True, padx=(0, 10))
+        info_card.columnconfigure(1, weight=1)
 
-        ttk.Label(info_frame, text="书名:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.title_label = ttk.Label(info_frame, text="")
-        self.title_label.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(info_card, text="书籍信息", style='Card.TLabelframe.Label').grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=(0, 8))
 
-        ttk.Label(info_frame, text="作者:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
-        self.author_label = ttk.Label(info_frame, text="")
-        self.author_label.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        info_rows = [
+            ("书名", 'title_label'),
+            ("作者", 'author_label'),
+            ("出版社", 'publisher_label'),
+            ("出版时间", 'publish_date_label'),
+            ("全书字数", 'total_words_label'),
+        ]
+        for index, (text, attr) in enumerate(info_rows, start=1):
+            ttk.Label(info_card, text=text, style='InfoKey.TLabel').grid(
+                row=index, column=0, sticky='nw', pady=4, padx=(0, 10))
+            widget = ttk.Label(info_card, text="", style='InfoValue.TLabel',
+                               wraplength=140, justify=tk.LEFT)
+            widget.grid(row=index, column=1, sticky='nw', pady=4)
+            setattr(self, attr, widget)
 
-        ttk.Label(info_frame, text="出版社:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
-        self.publisher_label = ttk.Label(info_frame, text="")
-        self.publisher_label.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        # ===== 中：章节列表 =====
+        middle_frame = ttk.Frame(main_pane, width=280)
+        main_pane.add(middle_frame, weight=1)
 
-        ttk.Label(info_frame, text="出版时间:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=2)
-        self.publish_date_label = ttk.Label(info_frame, text="")
-        self.publish_date_label.grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
+        list_header = ttk.Frame(middle_frame)
+        list_header.pack(fill=tk.X, padx=(0, 10), pady=(0, 6))
+        ttk.Label(list_header, text="章节列表",
+                  style='Title.TLabel').pack(side=tk.LEFT)
+        self.chapter_count_label = ttk.Label(list_header, text="共 0 章",
+                                             style='Muted.TLabel')
+        self.chapter_count_label.pack(side=tk.RIGHT)
 
-        ttk.Label(info_frame, text="全书字数:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=2)
-        self.total_words_label = ttk.Label(info_frame, text="")
-        self.total_words_label.grid(row=4, column=1, sticky=tk.W, padx=5, pady=2)
+        list_card = ttk.Frame(middle_frame, style='Card.TFrame', padding=1)
+        list_card.pack(fill=tk.BOTH, expand=True, padx=(0, 10))
 
-        # 中间章节列表区域
-        middle_frame = ttk.Frame(main_pane, width=300)
-        main_pane.add(middle_frame, weight=30)
-
-        ttk.Label(middle_frame, text="章节列表").pack(pady=(0, 5))
-
-        # 章节列表框架
-        list_frame = ttk.Frame(middle_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-
-        # 章节列表
         self.chapter_listbox = tk.Listbox(
-            list_frame,
-            exportselection=False,
-            activestyle='none',
-            font=self.base_font
-        )
-        chapter_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.chapter_listbox.yview)
+            list_card, exportselection=False, activestyle='none',
+            font=self.ui_font, background=theme.SURFACE,
+            foreground=theme.TEXT, selectbackground=theme.ACCENT,
+            selectforeground='#ffffff', highlightthickness=0, bd=0,
+            selectborderwidth=0, relief='flat')
+        chapter_scrollbar = ttk.Scrollbar(list_card, orient=tk.VERTICAL,
+                                          command=self.chapter_listbox.yview)
         self.chapter_listbox.configure(yscrollcommand=chapter_scrollbar.set)
-
-        self.chapter_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.chapter_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                                  padx=(6, 0), pady=6)
         chapter_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 绑定章节列表事件
         self.chapter_listbox.bind('<ButtonRelease-1>', self.on_chapter_select)
         self.chapter_listbox.bind('<Button-3>', self.on_chapter_right_click)
+        self.chapter_listbox.bind(
+            '<Alt-Up>',
+            lambda e: self.move_chapter_up(self.chapter_listbox.curselection()[0])
+            if self.chapter_listbox.curselection() else None)
+        self.chapter_listbox.bind(
+            '<Alt-Down>',
+            lambda e: self.move_chapter_down(self.chapter_listbox.curselection()[0])
+            if self.chapter_listbox.curselection() else None)
 
-        # 右侧章节内容区域
+        # ===== 右：章节内容 =====
         right_frame = ttk.Frame(main_pane)
-        main_pane.add(right_frame, weight=50)
+        main_pane.add(right_frame, weight=2)
 
-        # 章节操作工具栏
-        chapter_tools_frame = ttk.Frame(right_frame)
-        chapter_tools_frame.pack(fill=tk.X, pady=(0, 5))
-
-        ttk.Label(chapter_tools_frame, text="章节内容").pack(pady=(0, 5))
-
-        self.chapter_save_button = ttk.Button(
-            chapter_tools_frame,
-            text="保存修改",
-            command=self.save_chapter_content,
-            state="disabled"
-        )
-        self.chapter_save_button.pack(side=tk.LEFT, padx=(5, 0))
+        content_header = ttk.Frame(right_frame)
+        content_header.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(content_header, text="章节内容",
+                  style='Title.TLabel').pack(side=tk.LEFT)
 
         self.convert_chapter_button = ttk.Button(
-            chapter_tools_frame,
-            text="转有声书",
-            command=self.convert_current_chapter,
-            state="disabled"
-        )
-        self.convert_chapter_button.pack(side=tk.LEFT, padx=(5, 0))
+            content_header, text="转有声书", command=self.convert_current_chapter,
+            state="disabled", style='Accent.TButton')
+        self.convert_chapter_button.pack(side=tk.RIGHT)
 
-        # 章节内容文本框
+        self.chapter_save_button = ttk.Button(
+            content_header, text="保存修改", command=self.save_chapter_content,
+            state="disabled")
+        self.chapter_save_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+        content_card = ttk.Frame(right_frame, style='Card.TFrame', padding=1)
+        content_card.pack(fill=tk.BOTH, expand=True)
+
         self.chapter_text = scrolledtext.ScrolledText(
-            right_frame,
-            wrap=tk.WORD,
-            font=self.base_font,
-            padx=5,
-            pady=5
-        )
-        self.chapter_text.pack(fill=tk.BOTH, expand=True)
+            content_card, wrap=tk.WORD, font=self.read_font,
+            padx=14, pady=12, background=theme.READ_BG,
+            foreground=theme.TEXT, relief='flat', bd=0,
+            insertbackground=theme.ACCENT, spacing1=2, spacing3=6)
+        self.chapter_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
+        self._update_chapter_count()
     def create_mp3_converter_ui(self):
         """创建有声书转换UI"""
         # 使用Grid布局管理器
-        mp3_main_frame = ttk.Frame(self.mp3_frame, padding=10)
+        mp3_main_frame = ttk.Frame(self.mp3_frame, padding=(0, 4))
         mp3_main_frame.pack(fill=tk.BOTH, expand=True)
+        mp3_main_frame.columnconfigure(0, weight=1)
+        # 行 0-3：配置卡片；行 4：日志抽屉（展开时吃满剩余高度）；行 5：动作按钮栏
+        mp3_main_frame.rowconfigure(4, weight=1)
 
-        # 输入输出目录设置
-        dir_frame = ttk.LabelFrame(mp3_main_frame, text="目录设置", padding=5)
-        dir_frame.pack(fill=tk.X, pady=(0, 10))
+        # ---------- 目录设置 ----------
+        dir_frame = ttk.LabelFrame(mp3_main_frame, text=" 输出位置 ", padding=(12, 9))
+        dir_frame.grid(row=0, column=0, sticky='ew', pady=(0, 9))
+        dir_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(dir_frame, text="输出目录:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(dir_frame, text="输出目录").grid(
+            row=0, column=0, sticky='w', padx=(0, 10), pady=3)
         self.output_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "有声书目录"))
-        output_entry = ttk.Entry(dir_frame, textvariable=self.output_dir_var, width=40)
-        output_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
-        ttk.Button(dir_frame, text="浏览...", command=lambda: self.browse_directory(self.output_dir_var)).grid(row=1,
-                                                                                                             column=2,
-                                                                                                             padx=5,
-                                                                                                             pady=5)
+        output_entry = ttk.Entry(dir_frame, textvariable=self.output_dir_var)
+        output_entry.grid(row=0, column=1, sticky='ew', pady=3)
+        ttk.Button(dir_frame, text="浏览…",
+                   command=lambda: self.browse_directory(self.output_dir_var)).grid(
+            row=0, column=2, padx=(10, 0), pady=4)
 
-        # TTS配置设置
-        tts_frame = ttk.LabelFrame(mp3_main_frame, text="TTS配置", padding=5)
-        tts_frame.pack(fill=tk.X, pady=(0, 10))
+        # ---------- TTS 配置 ----------
+        tts_frame = ttk.LabelFrame(mp3_main_frame, text=" 语音合成 ", padding=(12, 9))
+        tts_frame.grid(row=1, column=0, sticky='ew', pady=(0, 9))
+        tts_frame.columnconfigure(1, weight=1)
 
-        # TTS引擎选择
-        ttk.Label(tts_frame, text="TTS引擎:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(tts_frame, text="TTS 引擎").grid(
+            row=0, column=0, sticky='w', padx=(0, 10), pady=3)
         self.tts_engine_var = tk.StringVar(value=AppConfig.DEFAULT_TTS_ENGINE)
-        tts_engine_combo = ttk.Combobox(tts_frame, textvariable=self.tts_engine_var, width=15, state="readonly")
-        tts_engine_combo['values'] = [
-            "edge-tts",
-            "gtts",
-            "pyttsx3",
-        ]
-        tts_engine_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        tts_engine_combo = ttk.Combobox(
+            tts_frame, textvariable=self.tts_engine_var, width=16, state="readonly")
+        tts_engine_combo['values'] = ["edge-tts", "gtts", "pyttsx3"]
+        tts_engine_combo.grid(row=0, column=1, sticky='w', pady=3)
         tts_engine_combo.bind('<<ComboboxSelected>>', self.on_tts_engine_changed)
 
-        ttk.Label(tts_frame, text="语音:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(tts_frame, text="语音").grid(
+            row=1, column=0, sticky='w', padx=(0, 10), pady=3)
         self.voice_var = tk.StringVar(value=DEFAULT_VOICE)
-        self.voice_combo = ttk.Combobox(tts_frame, textvariable=self.voice_var, width=30)
-        self.voice_combo.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
-        
+        self.voice_combo = ttk.Combobox(
+            tts_frame, textvariable=self.voice_var, state="readonly")
+        self.voice_combo.grid(row=1, column=1, sticky='ew', pady=3)
+        self.preview_button = ttk.Button(tts_frame, text="试听")
+        self.preview_button.grid(row=1, column=2, padx=(10, 0), pady=4)
+
+        ttk.Label(tts_frame, text="歌词每行字数", width=12, anchor='w').grid(
+            row=2, column=0, sticky='w', padx=(0, 10), pady=3)
+        self.chars_per_line_var = tk.IntVar(value=DEFAULT_CHARS_PER_LINE)
+        spinbox = ttk.Spinbox(tts_frame, from_=5, to=50,
+                              textvariable=self.chars_per_line_var, width=8)
+        spinbox.grid(row=2, column=1, sticky='w', pady=3)
+        ttk.Label(tts_frame, text="建议 10-20 字", style='Muted.TLabel').grid(
+            row=2, column=2, sticky='w', padx=(10, 0), pady=4)
+
         # 初始化语音列表
         self.update_voice_list()
 
@@ -2204,8 +3551,8 @@ class EpubToMp3App:
             self.append_log(f"试听TTS引擎: {tts_engine}")
             self.append_log(f"试听语音: {voice}")
             
-            # 为试听创建独立的临时文件
-            preview_mp3 = tempfile.mktemp(suffix='.mp3', prefix='epubReader_preview_')
+            # 为试听创建独立的临时文件（mkstemp：原子创建，避免 mktemp 的竞争）
+            preview_mp3 = self.new_temp_path(suffix='.mp3', prefix='preview')
             
             # *** 使用任务调度器执行 TTS 预览 ***
             async def generate_preview_audio():
@@ -2295,75 +3642,78 @@ class EpubToMp3App:
                 task_type=TaskType.TTS,
                 func=generate_preview_audio,
                 callback=on_preview_success,
-                error_callback=on_preview_error
+                error_callback=on_preview_error,
+                timeout=120  # 试听短文本，超过 2 分钟视为异常
             )
-            self.task_scheduler.submit_task(task)
+            self.submit_scheduler_task(task)
 
         # ====== 试听按钮结束 ======
-        preview_btn = ttk.Button(tts_frame, text="试听", command=tts_preview)
-        preview_btn.grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        self.preview_button.config(command=tts_preview)
 
-        ttk.Label(tts_frame, text="歌词每行字数:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.chars_per_line_var = tk.IntVar(value=DEFAULT_CHARS_PER_LINE)
-        spinbox = ttk.Spinbox(tts_frame, from_=5, to=50, textvariable=self.chars_per_line_var, width=5)
-        spinbox.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        # ---------- 元数据与封面 ----------
+        tag_frame = ttk.LabelFrame(mp3_main_frame, text=" 元数据与封面 ", padding=(12, 9))
+        tag_frame.grid(row=2, column=0, sticky='ew', pady=(0, 9))
+        tag_frame.columnconfigure(1, weight=1)
+        tag_frame.columnconfigure(3, weight=1)
 
-        # MP3标签设置
-        tag_frame = ttk.LabelFrame(mp3_main_frame, text="MP3标签", padding=5)
-        tag_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(tag_frame, text="艺术家:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(tag_frame, text="艺术家").grid(row=0, column=0, sticky='w', padx=(0, 10), pady=3)
         self.artist_var = tk.StringVar(value=DEFAULT_ARTIST)
-        self.artist_entry = ttk.Entry(tag_frame, textvariable=self.artist_var, width=30, state='disabled')
-        self.artist_entry.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        self.artist_entry = ttk.Entry(tag_frame, textvariable=self.artist_var, state='disabled')
+        self.artist_entry.grid(row=0, column=1, sticky='ew', pady=3)
 
-        ttk.Label(tag_frame, text="专辑:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(tag_frame, text="专辑").grid(row=0, column=2, sticky='w', padx=(16, 10), pady=4)
         self.album_var = tk.StringVar(value="有声书")
-        self.album_entry = ttk.Entry(tag_frame, textvariable=self.album_var, width=30, state='disabled')
-        self.album_entry.grid(row=0, column=3, sticky=tk.W, padx=5, pady=5)
+        self.album_entry = ttk.Entry(tag_frame, textvariable=self.album_var, state='disabled')
+        self.album_entry.grid(row=0, column=3, sticky='ew', pady=3)
 
-        ttk.Label(tag_frame, text="封面图片:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(tag_frame, text="封面图片").grid(row=1, column=0, sticky='w', padx=(0, 10), pady=3)
         self.cover_path_var = tk.StringVar()
-        self.cover_entry = ttk.Entry(tag_frame, textvariable=self.cover_path_var, width=30, state='disabled')
-        self.cover_entry.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
-        self.cover_button = ttk.Button(tag_frame, text="选择...", command=self.browse_cover_image, state='disabled')
-        self.cover_button.grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
+        self.cover_entry = ttk.Entry(tag_frame, textvariable=self.cover_path_var, state='disabled')
+        self.cover_entry.grid(row=1, column=1, columnspan=2, sticky='ew', pady=3)
+        self.cover_button = ttk.Button(tag_frame, text="选择…",
+                                       command=self.browse_cover_image, state='disabled')
+        self.cover_button.grid(row=1, column=3, sticky='w', pady=3)
 
         # 输出格式选择
-        format_frame = ttk.LabelFrame(mp3_main_frame, text="输出格式", padding=5)
-        format_frame.pack(fill=tk.X, pady=(0, 10))
+        format_frame = ttk.LabelFrame(mp3_main_frame, text=" 输出格式 ",
+                                      padding=(14, 12))
+        format_frame.grid(row=3, column=0, sticky='ew', pady=(0, 9))
+        format_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(format_frame, text="选择格式:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(format_frame, text="格式").grid(
+            row=0, column=0, sticky='w', padx=(0, 10), pady=3)
         self.output_format_var = tk.StringVar(value="MP3")
         format_radio_frame = ttk.Frame(format_frame)
-        format_radio_frame.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
-        
-        ttk.Radiobutton(format_radio_frame, text="MP3 (分章节)", 
-                       variable=self.output_format_var, value="MP3").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(format_radio_frame, text="M4B (合并为单个有声书)", 
-                       variable=self.output_format_var, value="M4B").pack(side=tk.LEFT, padx=5)
-        
-        # 并发线程数设置
-        ttk.Label(format_frame, text="并发线程数:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        format_radio_frame.grid(row=0, column=1, columnspan=2, sticky='w', pady=3)
+
+        ttk.Radiobutton(format_radio_frame, text="MP3（按章节拆分）",
+                        variable=self.output_format_var, value="MP3").pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Radiobutton(format_radio_frame, text="M4B（合并为单本有声书）",
+                        variable=self.output_format_var, value="M4B").pack(side=tk.LEFT)
+
+        ttk.Label(format_frame, text="并发章节数").grid(
+            row=1, column=0, sticky='w', padx=(0, 10), pady=3)
         self.concurrent_threads_var = tk.IntVar(value=3)
-        thread_spinbox = ttk.Spinbox(format_frame, from_=1, to=5, textvariable=self.concurrent_threads_var, width=10)
-        thread_spinbox.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
-        ttk.Label(format_frame, text="(1-5个章节同时处理，提升速度)", font=self.small_font).grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
-        
+        thread_spinbox = ttk.Spinbox(format_frame, from_=1, to=5,
+                                     textvariable=self.concurrent_threads_var, width=8)
+        thread_spinbox.grid(row=1, column=1, sticky='w', pady=3)
+        ttk.Label(format_frame, text="1-5 章同时合成", style='Muted.TLabel').grid(
+            row=1, column=2, sticky='w', padx=(10, 0), pady=4)
+
         # FFmpeg状态显示和安装按钮
         ffmpeg_status_frame = ttk.Frame(format_frame)
-        ffmpeg_status_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(5, 5))
-        
-        self.ffmpeg_status_label = ttk.Label(ffmpeg_status_frame, 
-                                             text="FFmpeg状态: 检测中...",
-                                             font=self.small_font)
+        ffmpeg_status_frame.grid(row=2, column=0, columnspan=3, sticky='w', pady=(8, 0))
+
+        self.ffmpeg_status_label = ttk.Label(ffmpeg_status_frame,
+                                             text="FFmpeg 状态：检测中...",
+                                             font=self.ui_font)
         self.ffmpeg_status_label.pack(side=tk.LEFT, padx=(0, 10))
-        
+
         self.ffmpeg_install_button = ttk.Button(ffmpeg_status_frame,
-                                               text="安装FFmpeg",
-                                               command=self.install_ffmpeg_dialog,
-                                               state="disabled")
-        self.ffmpeg_install_button.pack(side=tk.LEFT, padx=(0, 5))
+                                                text="安装 FFmpeg",
+                                                command=self.install_ffmpeg_dialog,
+                                                state="disabled")
+        self.ffmpeg_install_button.pack(side=tk.LEFT, padx=(0, 6))
         
         self.ffmpeg_manual_install_button = ttk.Button(ffmpeg_status_frame,
                                                        text="从本地ZIP安装",
@@ -2371,22 +3721,14 @@ class EpubToMp3App:
                                                        state="disabled")
         self.ffmpeg_manual_install_button.pack(side=tk.LEFT)
 
-        # 转换按钮和进度
-        self.batch_button_frame = ttk.Frame(mp3_main_frame, padding=5)
-        self.batch_button_frame.pack(fill=tk.X, pady=(0, 5))
-
-        # 添加预计耗时标签
-        self.estimated_time_var = tk.StringVar(value="预计耗时：00:00:00")
-        self.estimated_time_label = ttk.Label(
-            self.batch_button_frame,
-            textvariable=self.estimated_time_var,
-            font=self.small_font
-        )
-        self.estimated_time_label.pack(side=tk.LEFT, padx=(0, 10))
+        # ---------- 动作按钮 ----------
+        self.batch_button_frame = ttk.Frame(mp3_main_frame, style='Toolbar.TFrame',
+                                            padding=(14, 8))
+        self.batch_button_frame.grid(row=5, column=0, sticky='ew')
 
         self.generate_ebook_button = ttk.Button(
             self.batch_button_frame,
-            text="生成电子书",
+            text="生成有声书",
             command=self.start_generate_ebook,
             style="Accent.TButton"
         )
@@ -2395,18 +3737,16 @@ class EpubToMp3App:
         # 合并MP3为M4B按钮
         self.merge_to_m4b_button = ttk.Button(
             self.batch_button_frame,
-            text="合并MP3为M4B",
-            command=self.merge_mp3_to_m4b_dialog,
-            style="Accent.TButton"
+            text="合并 MP3 为 M4B",
+            command=self.merge_mp3_to_m4b_dialog
         )
         self.merge_to_m4b_button.pack(side=tk.LEFT, padx=(0, 10))
         
         # TXT批量转换按钮
         self.batch_txt_button = ttk.Button(
             self.batch_button_frame,
-            text="TXT批量转换",
-            command=self.batch_convert_txt_dialog,
-            style="Accent.TButton"
+            text="TXT 批量转换",
+            command=self.batch_convert_txt_dialog
         )
         self.batch_txt_button.pack(side=tk.LEFT, padx=(0, 10))
         
@@ -2414,23 +3754,82 @@ class EpubToMp3App:
         self.retry_failed_button = ttk.Button(
             self.batch_button_frame,
             text="重新处理失败章节",
-            command=self.retry_failed_chapters,
-            style="Accent.TButton"
+            command=self.retry_failed_chapters
         )
         # 初始状态不显示
 
-        # 转换进度和日志区域
-        log_frame = ttk.LabelFrame(mp3_main_frame, text="运行日志", padding=5)
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        self.estimated_time_var = tk.StringVar(value="预计耗时 00:00:00")
+        self.estimated_time_label = ttk.Label(
+            self.batch_button_frame,
+            textvariable=self.estimated_time_var,
+            style='SurfaceMuted.TLabel'
+        )
+        self.estimated_time_label.pack(side=tk.RIGHT, padx=(10, 0))
+
+        # ---------- 运行日志（可折叠，默认收起） ----------
+        # 默认展开会把配置区挤出可视区，导致窗口较小时"日志不见了"，因此做成抽屉式。
+        self.log_frame = ttk.LabelFrame(mp3_main_frame, text=" 运行日志 ",
+                                        padding=(14, 8))
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame,
+            self.log_frame,
             wrap=tk.WORD,
-            font=self.small_font,
-            background="#f8f8f8"
+            font=(UITheme.FONT_FAMILY, 9),
+            background=UITheme.READ_BG,
+            foreground=UITheme.TEXT,
+            relief='flat', bd=0, padx=8, pady=6, height=8
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text.config(state=tk.DISABLED)  # 只读
+
+        self.log_toggle_button = ttk.Button(
+            self.batch_button_frame, text="显示日志",
+            command=self.toggle_log_panel, style='Ghost.TButton')
+        self.log_toggle_button.pack(side=tk.RIGHT, padx=(10, 10))
+
+        self.batch_hint_label = ttk.Label(
+            self.batch_button_frame,
+            text="提示：先选好格式与语音，再点「生成有声书」；详细记录可点右侧「显示日志」。",
+            style='SurfaceMuted.TLabel')
+        self.batch_hint_label.pack(side=tk.BOTTOM, anchor='w', pady=(10, 0))
+
+    # 日志抽屉展开时需要的额外高度（配置区 + 日志本身）
+    LOG_PANEL_EXTRA_HEIGHT = 185
+
+    def toggle_log_panel(self):
+        """展开/收起运行日志抽屉
+
+        设置页的配置卡片本身就要 600+ px，如果不给窗口留出空间，
+        展开日志只会挤出一条约 40px 的缝隙——和"日志不见了"没区别。
+        因此展开时按需增高窗口，收起时缩回，并保证不超出屏幕。
+        """
+        root = self.root
+        if self.log_frame.winfo_ismapped():
+            self.log_frame.grid_forget()
+            self.log_toggle_button.config(text="显示日志")
+            self._resize_window_for_log(expand=False)
+        else:
+            self.log_frame.grid(row=4, column=0, sticky='nsew')
+            self.log_toggle_button.config(text="收起日志")
+            self._resize_window_for_log(expand=True)
+
+    def _resize_window_for_log(self, expand):
+        """日志抽屉开关时调整窗口高度（不超出屏幕可用区域）"""
+        root = self.root
+        try:
+            root.update_idletasks()
+            width = root.winfo_width()
+            height = root.winfo_height()
+            screen_h = root.winfo_screenheight()
+            max_height = int(screen_h * 0.94)
+            delta = self.LOG_PANEL_EXTRA_HEIGHT
+            target = min(height + delta, max_height) if expand else max(
+                height - delta, self.MIN_WINDOW_HEIGHT)
+            if target != height:
+                root.geometry('%dx%d+%d+%d' % (
+                    width, target, root.winfo_x(), root.winfo_y()))
+        except tk.TclError:
+            pass
 
     def browse_directory(self, var):
         """浏览并选择目录"""
@@ -2454,21 +3853,51 @@ class EpubToMp3App:
         self.update_voice_list()
     
     def update_voice_list(self):
-        """根据TTS引擎更新语音列表"""
+        """根据TTS引擎更新语音列表
+
+        pyttsx3 的语音枚举要初始化 COM，可能阻塞数秒，因此放到后台线程，
+        枚举完成后经 message_queue 回到主线程填充下拉框（原实现是同步调用，
+        会在 GUI 初始化阶段卡住窗口）。
+        """
         engine_name = self.tts_engine_var.get()
         engine = get_tts_engine(engine_name)
-        
-        # 获取可用语音
-        voices = engine.get_available_voices()
-        
-        # 格式化为显示列表
-        voice_display = [f"{code} - {name}" for code, name in voices]
+
+        # 内置引擎（edge-tts / gtts）列表是静态的，直接填
+        static_voices = getattr(engine, 'STATIC_VOICES', None)
+        if static_voices is None:
+            try:
+                voices = engine.get_available_voices()
+            except Exception as e:
+                print(f"获取语音列表失败: {e}", file=sys.stderr)
+                voices = []
+            self._apply_voice_list(voice_display=[f"{c} - {n}" for c, n in voices],
+                                   default=voices[0] if voices else None)
+            return
+
+        # 需要运行时枚举：先填占位值，再后台枚举
+        self._apply_voice_list(voice_display=[f"{c} - {n}" for c, n in static_voices],
+                              default=static_voices[0] if static_voices else None)
+
+        def worker():
+            try:
+                voices = engine.get_available_voices()
+            except Exception as e:
+                print(f"枚举语音失败: {e}", file=sys.stderr)
+                return
+            if not voices:
+                return
+            self.message_queue.put(
+                ("voice_list", ([f"{c} - {n}" for c, n in voices], voices[0])))
+
+        threading.Thread(target=worker, daemon=True, name="VoiceEnum").start()
+
+    def _apply_voice_list(self, voice_display, default=None):
+        """在主线程填充语音下拉框"""
         self.voice_combo['values'] = voice_display
-        
-        # 设置默认值
-        if voices:
-            default_voice = f"{voices[0][0]} - {voices[0][1]}"
-            self.voice_var.set(default_voice)
+        if default:
+            self.voice_var.set(f"{default[0]} - {default[1]}")
+        elif voice_display:
+            self.voice_var.set(voice_display[0])
     
     def get_selected_voice_code(self):
         """从选中的语音显示中提取语音代码"""
@@ -2505,9 +3934,10 @@ class EpubToMp3App:
             func=parse_epub_data,
             args=(file_path,),
             callback=lambda result: self._on_epub_parsed(result, file_path),
-            error_callback=lambda error: self._on_epub_parse_error(error, file_path)
+            error_callback=lambda error: self._on_epub_parse_error(error, file_path),
+            timeout=600  # 超大 EPUB 也需要能在 10 分钟内给出结果
         )
-        self.task_scheduler.submit_task(task)
+        self.submit_scheduler_task(task)
     
     def _on_epub_parsed(self, epub_data, file_path):
         """解析成功回调"""
@@ -2524,7 +3954,7 @@ class EpubToMp3App:
         error_msg = str(error)
         self.message_queue.put(("status", f"解析出错: {error_msg}"))
         self.message_queue.put(("error", f"解析EPUB文件时发生错误: {error_msg}"))
-        traceback.print_exc()
+        print(f"解析EPUB失败: {error_msg}", file=sys.stderr)
 
     def process_messages(self):
         """处理消息队列的消息，更新UI"""
@@ -2543,11 +3973,20 @@ class EpubToMp3App:
                     self.progress_var.set(data)
                 elif message_type == "log":
                     self.append_log(data)
+                elif message_type == "batch_progress":
+                    done, total = data
+                    self.set_batch_hint(f"正在合成：{done}/{total} 章")
+                    self.update_status(f"处理中：{done}/{total}")
+                elif message_type == "voice_list":
+                    # 后台枚举语音完成（pyttsx3 等），回到主线程填下拉框
+                    voice_display, default_voice = data
+                    self._apply_voice_list(voice_display, default_voice)
                 elif message_type == "batch_complete":
                     self.on_batch_complete()
                 elif message_type == "failed_chapter":
-                    # 记录失败的章节
-                    self.failed_chapters.append(data)
+                    # 记录失败的章节（加锁，避免与后台线程互改）
+                    with self.failed_chapters_lock:
+                        self.failed_chapters.append(data)
                 elif message_type == "show_retry_button":
                     # 显示重试按钮
                     self.retry_failed_button.pack(side=tk.LEFT, padx=(0, 10))
@@ -2556,13 +3995,15 @@ class EpubToMp3App:
                     self.retry_failed_button.pack_forget()
                 elif message_type == "clear_failed_chapters":
                     # 清空失败章节列表
-                    self.failed_chapters.clear()
+                    with self.failed_chapters_lock:
+                        self.failed_chapters.clear()
             
             # *** 处理任务调度器的回调 ***
             result = self.task_scheduler.get_result()
             while result:
                 result_type, callback, args = result
-                if result_type == "callback" and callback:
+                # callback 与 progress 都由主线程执行，progress 只在回调被覆盖时才需要
+                if result_type in ("callback", "progress") and callback:
                     try:
                         callback(*args)
                     except Exception as e:
@@ -2573,12 +4014,25 @@ class EpubToMp3App:
         except queue.Empty:
             pass
         finally:
-            # 继续检查队列
-            self.root.after(100, self.process_messages)
+            # 继续检查队列（窗口关闭/退出时不再续期，避免测试收尾后仍有回调）
+            if not getattr(self, '_stopping', False):
+                try:
+                    self.root.after(100, self.process_messages)
+                except tk.TclError:
+                    pass
 
     def update_status(self, message):
-        """更新状态栏信息"""
-        self.status_label.config(text=f"状态: {message}")
+        """更新状态栏信息（左侧已有固定"状态"标签，这里只放内容）"""
+        self.status_label.config(text=str(message))
+
+    def set_batch_hint(self, text):
+        """更新动作栏第二行的进度说明（不占用底部状态栏）"""
+        hint = getattr(self, 'batch_hint_label', None)
+        if hint is not None:
+            try:
+                hint.config(text=text)
+            except tk.TclError:
+                pass
 
     def append_log(self, message):
         """向日志文本框添加消息"""
@@ -2599,9 +4053,9 @@ class EpubToMp3App:
 
         # 重置预计耗时
         if hasattr(self, 'estimated_time_var') and self.estimated_time_var:
-            self.estimated_time_var.set("预计耗时：00:00:00")
+            self.estimated_time_var.set("预计耗时 00:00:00")
         if hasattr(self, 'estimated_time_var_epub_tab') and self.estimated_time_var_epub_tab:
-            self.estimated_time_var_epub_tab.set("预计耗时：00:00:00")
+            self.estimated_time_var_epub_tab.set("预计耗时 00:00:00")
 
         # 清空封面
         self.cover_label.config(image="", text="图书封面")
@@ -2652,7 +4106,10 @@ class EpubToMp3App:
         self.cover_button.config(state='normal')
 
         # 显示封面图片
-        if self.epub_data['cover_data']:
+        # 注意：封面处理必须自成错误边界。原实现里 Image.open 失败会抛出到外层，
+        # 导致后面的"章节列表/导出按钮/输出目录/预计耗时"全部被跳过，
+        # 界面看起来像"没读到书"。损坏或格式异常的封面不该影响其余显示逻辑。
+        if self.epub_data.get('cover_data'):
             try:
                 image_data = self.epub_data['cover_data']
                 img = Image.open(io.BytesIO(image_data))
@@ -2665,21 +4122,26 @@ class EpubToMp3App:
                 photo = ImageTk.PhotoImage(img)
                 self.cover_label.config(image=photo, text="")
                 self.cover_label.image = photo  # 保持引用
-
-                # 保存封面文件到临时目录（使用独立文件名）
-                cover_path = tempfile.mktemp(suffix='.jpg', prefix='epubReader_cover_')
-                with open(cover_path, "wb") as f:
-                    f.write(image_data)
-                self.cover_path_var.set(cover_path)
-
             except Exception as e:
-                print(f"显示封面图片时出错: {e}")
-                self.cover_label.config(text="无法显示封面")
+                print(f"显示封面图片时出错（不影响其余信息）: {e}", file=sys.stderr)
+                self.cover_label.config(image="", text="封面无法显示")
+                self.cover_label.image = None
+
+            # 无论缩略图是否成功，都把原始封面落到临时文件供 MP3/M4B 使用
+            try:
+                cover_path = self.new_temp_path(suffix='.jpg', prefix='cover')
+                with open(cover_path, "wb") as f:
+                    f.write(self.epub_data['cover_data'])
+                self.cover_path_var.set(cover_path)
+            except Exception as e:
+                print(f"写入封面临时文件失败（不影响其余信息）: {e}", file=sys.stderr)
         else:
-            self.cover_label.config(text="无封面图片")
+            self.cover_label.config(image="", text="无封面图片")
+            self.cover_label.image = None
 
         # 显示章节列表
         self.chapter_listbox.delete(0, tk.END)
+        self._update_chapter_count()
         if self.epub_data.get('chapters'):
             for i, chapter in enumerate(self.epub_data['chapters']):
                 title = chapter.get('title', f"章节 {i + 1}")
@@ -2713,8 +4175,8 @@ class EpubToMp3App:
 
         # ---- 新增：计算并显示预计耗时 ----
         estimated_time = self.calculate_estimated_time()
-        self.estimated_time_var.set(f"预计耗时：{estimated_time}")
-        self.estimated_time_var_epub_tab.set(f"预计耗时：{estimated_time}")
+        self.estimated_time_var.set(f"预计耗时 {estimated_time}")
+        self.estimated_time_var_epub_tab.set(f"预计耗时 {estimated_time}")
 
     def on_chapter_select(self, event):
         """处理章节列表选择事件"""
@@ -2766,6 +4228,9 @@ class EpubToMp3App:
 
         # 创建右键菜单
         menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="上移章节 (Alt+Up)", command=lambda: self.move_chapter_up(index))
+        menu.add_command(label="下移章节 (Alt+Down)", command=lambda: self.move_chapter_down(index))
+        menu.add_separator()
         menu.add_command(label="删除章节", command=lambda: self.delete_chapter(index))
         menu.add_command(label="导出为TXT", command=lambda: self.export_chapter_as_txt(index))
         menu.add_command(label="转换为MP3", command=lambda: self.convert_chapter_to_mp3(index))
@@ -2802,13 +4267,14 @@ class EpubToMp3App:
 
         # 更新GUI上的总字数显示
         self.total_words_label.config(text=str(self.epub_data['total_words']))
+        self._update_chapter_count()
 
         # 更新预计耗时标签
         estimated_time = self.calculate_estimated_time()
         if hasattr(self, 'estimated_time_var') and self.estimated_time_var:
-            self.estimated_time_var.set(f"预计耗时：{estimated_time}")
+            self.estimated_time_var.set(f"预计耗时 {estimated_time}")
         if hasattr(self, 'estimated_time_var_epub_tab') and self.estimated_time_var_epub_tab:
-            self.estimated_time_var_epub_tab.set(f"预计耗时：{estimated_time}")
+            self.estimated_time_var_epub_tab.set(f"预计耗时 {estimated_time}")
         # --- 新增代码结束 ---
 
         # 更新界面 (删除列表项、清空章节内容等)
@@ -2824,6 +4290,57 @@ class EpubToMp3App:
             self.current_chapter_index -= 1
 
         self.update_status(f"已删除章节: {chapter_title}")
+
+    def move_chapter_up(self, index):
+        """将章节上移"""
+        if index <= 0 or not self.epub_data or 'chapters' not in self.epub_data:
+            return
+        
+        # 交换数据
+        chapters = self.epub_data['chapters']
+        chapters[index], chapters[index-1] = chapters[index-1], chapters[index]
+        
+        # 更新界面
+        self._refresh_chapter_listbox(select_index=index-1)
+        self.update_status(f"已上移章节: {chapters[index-1]['title']}")
+
+    def move_chapter_down(self, index):
+        """将章节下移"""
+        if not self.epub_data or 'chapters' not in self.epub_data:
+            return
+        
+        chapters = self.epub_data['chapters']
+        if index < 0 or index >= len(chapters) - 1:
+            return
+            
+        # 交换数据
+        chapters[index], chapters[index+1] = chapters[index+1], chapters[index]
+        
+        # 更新界面
+        self._refresh_chapter_listbox(select_index=index+1)
+        self.update_status(f"已下移章节: {chapters[index+1]['title']}")
+
+    def _refresh_chapter_listbox(self, select_index=None):
+        """重新加载章节列表并保持选择"""
+        if not self.epub_data or 'chapters' not in self.epub_data:
+            return
+            
+        # 保存当前滚动位置
+        yview = self.chapter_listbox.yview()
+        
+        self.chapter_listbox.delete(0, tk.END)
+        for i, chapter in enumerate(self.epub_data['chapters']):
+            title = chapter.get('title', f"章节 {i + 1}")
+            self.chapter_listbox.insert(tk.END, f" {title}")
+        self._update_chapter_count()
+            
+        if select_index is not None:
+            self.chapter_listbox.select_set(select_index)
+            self.chapter_listbox.activate(select_index)
+            self.current_chapter_index = select_index
+            
+        # 还原滚动位置
+        self.chapter_listbox.yview_moveto(yview[0])
 
     def export_all_chapters(self):
         """导出所有章节为TXT文件"""
@@ -2942,18 +4459,12 @@ class EpubToMp3App:
             messagebox.showerror("错误", f"章节 '{title}' 没有内容可转换。")
             return
 
-        # 为此章节创建独立的临时目录
-        temp_dir = tempfile.mkdtemp(prefix='epubReader_chapter_')
-
-        # 保存章节内容到临时文件
+        # 计算安全文件名（不再创建临时目录/txt：
+        # 原实现 mkdtemp 出的 epubReader_chapter_* 既没被使用也从没被清理，
+        # 每次单章转换都会在系统临时目录里留下一个永久残留）
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
         if not safe_title:
             safe_title = f"章节{index + 1}"
-
-        # 保存内容到临时TXT (仅用于显示)
-        txt_path = os.path.join(temp_dir, f"{safe_title}.txt")
-        with open(txt_path, 'w', encoding='utf-8') as f:
-            f.write(content)
 
         # 设置输出目录
         output_dir = self.output_dir_var.get()
@@ -2995,7 +4506,10 @@ class EpubToMp3App:
             "cover_path": self.cover_path_var.get()
         }
 
-        # 开始转换
+        # 开始转换：原子占用，避免与批量任务同时写输出目录
+        if not self.try_begin_processing():
+            messagebox.showwarning("处理中", "有转换任务正在进行，请等待完成。")
+            return
         threading.Thread(
             target=self._convert_single_chapter_thread,
             args=(params,),
@@ -3012,8 +4526,7 @@ class EpubToMp3App:
         self.message_queue.put(("status", f"正在转换: {params['chapter_title']}..."))
         self.message_queue.put(("progress", 0))
 
-        # 禁用转换按钮
-        self.processing = True
+        # 禁用转换按钮（processing 已在上层占用）
         self.root.after(0, lambda: self.convert_chapter_button.config(state="disabled"))
 
         try:
@@ -3025,23 +4538,29 @@ class EpubToMp3App:
             elif self.epub_data and 'cover_data' in self.epub_data and self.epub_data['cover_data']:
                 cover_data = self.epub_data['cover_data']
 
-            # 使用asyncio运行edge-tts
+            # 在后台线程内自建自销事件循环（不再跨线程复用调度器的 loop）
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
             self.message_queue.put(("log", "正在生成MP3..."))
 
-            # 执行TTS转换（使用指定的TTS引擎）
-            result = loop.run_until_complete(
-                process_text_to_mp3(
-                    params['content'],
-                    params['output_mp3'],
-                    params['output_lrc'],
-                    params['voice'],
-                    params['chars_per_line'],
-                    tts_engine=params.get('tts_engine', 'edge-tts')
+            try:
+                # 执行TTS转换（使用指定的TTS引擎）
+                result = loop.run_until_complete(
+                    process_text_to_mp3(
+                        params['content'],
+                        params['output_mp3'],
+                        params['output_lrc'],
+                        params['voice'],
+                        params['chars_per_line'],
+                        tts_engine=params.get('tts_engine', 'edge-tts')
+                    )
                 )
-            )
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
 
             elapsed = time.time() - start_time
             elapsed_str = f"{elapsed:.2f} 秒"
@@ -3083,9 +4602,16 @@ class EpubToMp3App:
                     self.message_queue.put(("log", "添加ID3标签失败"))
                     self.message_queue.put(("status", "转换部分完成: ID3标签失败"))
             else:
+                # 弹窗里直接给出原因，别再把用户打发去翻日志
+                reason = ' '.join((LAST_TTS_FAILURE or '').split())
                 self.message_queue.put(("log", "MP3生成失败"))
+                if reason:
+                    self.message_queue.put(("log", "  原因: " + reason[:300]))
                 self.message_queue.put(("status", "转换失败"))
-                self.root.after(0, lambda: messagebox.showerror("转换失败", "生成MP3失败，请查看日志了解详情。"))
+                self.root.after(0, lambda: messagebox.showerror(
+                    "转换失败",
+                    "生成MP3失败。\n\n" + (reason[:600] if reason
+                                          else "详情见日志: " + AppConfig.LOG_PATH)))
 
         except Exception as e:
             self.message_queue.put(("log", f"转换失败: {str(e)}"))
@@ -3095,7 +4621,7 @@ class EpubToMp3App:
 
         finally:
             # 启用转换按钮
-            self.processing = False
+            self.end_processing()
             self.root.after(0, lambda: self.convert_chapter_button.config(state="normal"))
 
     def check_ffmpeg_on_startup(self):
@@ -3243,9 +4769,10 @@ class EpubToMp3App:
             func=download_task_wrapper,
             callback=on_download_success,
             error_callback=on_download_error,
-            cancellable=True
+            cancellable=True,
+            timeout=1800  # 5 个镜像源 × 最长下载时间
         )
-        self.task_scheduler.submit_task(task)
+        self.submit_scheduler_task(task)
     
     def install_ffmpeg_from_local(self):
         """从本地ZIP文件安装FFmpeg"""
@@ -3338,9 +4865,10 @@ class EpubToMp3App:
             task_type=TaskType.GENERAL,
             func=install_task_wrapper,
             callback=on_install_success,
-            error_callback=on_install_error
+            error_callback=on_install_error,
+            timeout=600  # 从本地 ZIP 解压安装
         )
-        self.task_scheduler.submit_task(task)
+        self.submit_scheduler_task(task)
     
     def merge_mp3_to_m4b_dialog(self):
         """显示MP3合并为M4B的对话框"""
@@ -3448,7 +4976,7 @@ class EpubToMp3App:
         scrollbar = ttk.Scrollbar(list_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        file_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=self.small_font)
+        file_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=self.ui_font)
         file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=file_listbox.yview)
         
@@ -3475,7 +5003,7 @@ class EpubToMp3App:
         
         if extracted_items:
             hint_text = f"✔ 已从 MP3 文件自动提取: {', '.join(extracted_items)}"
-            hint_label = ttk.Label(meta_frame, text=hint_text, foreground="green", font=self.small_font)
+            hint_label = ttk.Label(meta_frame, text=hint_text, foreground="green", font=self.ui_font)
             hint_label.grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(0, 5))
         
         ttk.Label(meta_frame, text="书名:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
@@ -3604,7 +5132,11 @@ class EpubToMp3App:
                 chapter_titles.append(title)
             
             # 启动后台线程合并
-            self.processing = True
+            # 原子占用，防止与批量生成同时操作同一批文件
+            if not self.try_begin_processing():
+                messagebox.showwarning("处理中", "有转换任务正在进行，请等待完成。")
+                return
+            self._m4b_cancel_event.clear()  # 复位上一次的中止信号
             self.generate_ebook_button.config(state="disabled")
             self.merge_to_m4b_button.config(state="disabled")
             
@@ -3620,13 +5152,21 @@ class EpubToMp3App:
                 "output_m4b": output_file,
                 "metadata": metadata,
                 "cover_data": cover_data,
-                "chapter_titles": chapter_titles
+                "chapter_titles": chapter_titles,
+                "cancel_event": self._m4b_cancel_event
             }
             
             threading.Thread(target=self._merge_mp3_thread, args=(params,), daemon=True).start()
         
         ttk.Button(button_frame, text="开始合并", command=start_merge).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="取消", command=merge_dialog.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="关闭", command=merge_dialog.destroy).pack(side=tk.LEFT, padx=5)
+        # 真正的取消：合并过程中可随时中止（原来只能关闭对话框，后台继续跑完）
+        cancel_merge_button = ttk.Button(
+            button_frame, text="中止合并",
+            command=lambda: (self._m4b_cancel_event.set(),
+                             cancel_merge_button.config(state="disabled"),
+                             self.update_status("已请求中止合并...")))
+        cancel_merge_button.pack(side=tk.LEFT, padx=5)
     
     def _merge_mp3_thread(self, params):
         """后台线程：合并MP3为M4B"""
@@ -3638,6 +5178,7 @@ class EpubToMp3App:
         metadata = params["metadata"]
         cover_data = params.get("cover_data")
         chapter_titles = params.get("chapter_titles")
+        cancel_event = params.get("cancel_event")
         
         self.message_queue.put(("log", f"合并 {len(mp3_files)} 个MP3文件为M4B格式..."))
         self.message_queue.put(("status", "正在合并为M4B..."))
@@ -3650,7 +5191,8 @@ class EpubToMp3App:
                 metadata,
                 cover_data,
                 self.ffmpeg_path,
-                chapter_titles
+                chapter_titles,
+                cancel_check=(cancel_event.is_set if cancel_event is not None else None)
             )
             
             elapsed = time.time() - start_time
@@ -3672,18 +5214,24 @@ class EpubToMp3App:
                 
                 self.root.after(0, show_success)
             else:
+                aborted = "取消" in (error_msg or "")
                 self.message_queue.put(("log", "=" * 50))
-                self.message_queue.put(("log", "M4B合并失败"))
+                self.message_queue.put(("log", "已中止M4B合并" if aborted else "M4B合并失败"))
                 if error_msg:
-                    self.message_queue.put(("log", f"失败原因: {error_msg}"))
+                    self.message_queue.put(("log", f"原因: {error_msg}"))
                 self.message_queue.put(("log", "=" * 50))
-                self.message_queue.put(("status", "M4B合并失败"))
-                
-                def show_error():
-                    error_detail = error_msg if error_msg else "未知错误"
-                    messagebox.showerror("合并失败", f"M4B文件生成失败\n\n错误信息:\n{error_detail}\n\n请查看日志了解更多详情。")
-                
-                self.root.after(0, show_error)
+                self.message_queue.put(("status", "已中止M4B合并" if aborted else "M4B合并失败"))
+
+                if aborted:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "已中止",
+                        "已按你的请求中止合并。\n中间文件已清理，原有 MP3 文件未受影响。"))
+                else:
+                    def show_error():
+                        error_detail = error_msg if error_msg else "未知错误"
+                        messagebox.showerror("合并失败", f"M4B文件生成失败\n\n错误信息:\n{error_detail}\n\n请查看日志了解更多详情。")
+
+                    self.root.after(0, show_error)
         
         except Exception as e:
             self.message_queue.put(("log", f"M4B合并出错: {str(e)}"))
@@ -3692,27 +5240,37 @@ class EpubToMp3App:
             self.root.after(0, lambda: messagebox.showerror("合并错误", str(e)))
         
         finally:
-            self.processing = False
+            self.end_processing()
             self.root.after(0, lambda: self.generate_ebook_button.config(state="normal"))
             self.root.after(0, lambda: self.merge_to_m4b_button.config(state="normal"))
     
     def start_generate_ebook(self):
         """从内存章节数据批量生成有声书（MP3+LRC）"""
-        if self.processing:
+        # 原子占用：避免连点导致两个批次同时写同一批输出文件
+        if not self.try_begin_processing():
             messagebox.showwarning("处理中", "有转换任务正在进行，请等待完成。")
             return
-        
+        try:
+            self._start_generate_ebook_locked()
+        except Exception as e:
+            self.end_processing()
+            raise
+
+    def _start_generate_ebook_locked(self):
+        """start_generate_ebook 的实际实现（调用前需已占用 processing）"""
         # 清空之前的失败记录
         self.message_queue.put(("clear_failed_chapters", None))
         self.message_queue.put(("hide_retry_button", None))
         
         # 检查epub_data
         if not self.epub_data or not self.epub_data.get('chapters'):
+            self.end_processing()
             messagebox.showerror("错误", "没有可用的电子书章节。请先加载EPUB文件。")
             return
         
         # 检查M4B格式是否需要FFmpeg
         if self.output_format_var.get() == "M4B" and not self.ffmpeg_installed:
+            self.end_processing()
             msg = "M4B格式需要安装FFmpeg。\n\n是否现在安装？"
             if messagebox.askyesno("需要FFmpeg", msg):
                 self.install_ffmpeg_dialog()
@@ -3721,6 +5279,7 @@ class EpubToMp3App:
         if not output_dir:
             output_dir = filedialog.askdirectory(title="选择输出目录")
             if not output_dir:
+                self.end_processing()
                 return
             self.output_dir_var.set(output_dir)
         os.makedirs(output_dir, exist_ok=True)
@@ -3751,9 +5310,9 @@ class EpubToMp3App:
             f"\n确定要开始转换吗？ 如果有错误，请在【设置与自定义】中进行修改。"
         )
         if not messagebox.askyesno("确认生成", msg):
+            self.end_processing()
             return
-        # 禁用按钮
-        self.processing = True
+        # 禁用按钮（processing 已在上层占用）
         self.generate_ebook_button.config(state="disabled")
         self.log_text.config(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
@@ -3762,7 +5321,7 @@ class EpubToMp3App:
         params = {
             "output_dir": output_dir,
             "chapters": self.epub_data['chapters'],
-            "voice": self.voice_var.get(),
+            "voice": self.get_selected_voice_code(),  # 传语音代码，而不是显示文本
             "chars_per_line": self.chars_per_line_var.get(),
             "artist": self.artist_var.get(),
             "album": self.album_var.get(),
@@ -3770,7 +5329,8 @@ class EpubToMp3App:
             "output_format": self.output_format_var.get(),
             "book_title": self.epub_data['title'],
             "ffmpeg_path": self.ffmpeg_path,
-            "concurrent_threads": self.concurrent_threads_var.get()  # 添加并发线程数
+            "concurrent_threads": self.concurrent_threads_var.get(),  # 并发数
+            "tts_engine": self.tts_engine_var.get()  # 关键修复：批量流程必须带上引擎
         }
         threading.Thread(target=self._generate_ebook_thread, args=(params,), daemon=True).start()
 
@@ -3848,11 +5408,15 @@ class EpubToMp3App:
     #     threading.Thread(target=self._batch_convert_thread, args=(params,), daemon=True).start()
 
     def _generate_ebook_thread(self, params):
-        """后台线程：从内存章节批量生成有声书（优化版：使用单一事件循环）"""
+        """后台线程：从内存章节批量生成有声书（修复版：单一事件循环 + 结果按索引回填）
+
+        关键修复：
+        1. 显式传递用户选择的 TTS 引擎（原实现会静默回退到 edge-tts）
+        2. 用自己的 asyncio.run 承载并发，不再跨线程复用事件循环
+        3. 结果按章节索引回填，合并 M4B 前重建列表，保证顺序与标题严格对应
+        """
         import time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading as th
-        
+
         start_time = time.time()
 
         output_dir = params["output_dir"]
@@ -3865,283 +5429,229 @@ class EpubToMp3App:
         output_format = params["output_format"]
         book_title = params["book_title"]
         ffmpeg_path = params.get("ffmpeg_path")
-        concurrent_threads = params.get("concurrent_threads", 3)  # 默认3个线程
-        
+        concurrent_threads = max(1, int(params.get("concurrent_threads") or 3))
+        tts_engine = params.get("tts_engine") or AppConfig.DEFAULT_TTS_ENGINE
+        # 重试任务只传失败章节的子集，这里显式保留它们在原书中的真实序号，
+        # 保证输出文件名与首次生成完全一致（否则重试会写出错误的序号文件）
+        chapter_indices = params.get("chapter_indices")
+        if not chapter_indices or len(chapter_indices) != len(chapters):
+            chapter_indices = list(range(len(chapters)))
+        total_chapters = len(chapters) or 1
+
         self.message_queue.put(("log", f"开始生成有声电子书，共 {len(chapters)} 个章节"))
         self.message_queue.put(("log", f"输出格式: {output_format}"))
-        self.message_queue.put(("log", f"并发线程数: {concurrent_threads}"))
+        self.message_queue.put(("log", f"TTS引擎: {tts_engine}"))
+        self.message_queue.put(("log", f"并发数: {concurrent_threads}"))
         self.message_queue.put(("status", f"处理中: 0/{len(chapters)}"))
-        
-        mp3_files = [None] * len(chapters)  # 使用索引存储，保持顺序
-        completed_count = 0
-        lock = th.Lock()  # 线程锁保护共享资源
-        
-        # 创建单一的事件循环用于所有异步任务（在专用线程中运行）
-        event_loop = asyncio.new_event_loop()
-        
-        # 在单独的线程中运行事件循环
-        def run_event_loop():
-            asyncio.set_event_loop(event_loop)
-            event_loop.run_forever()
-        
-        loop_thread = th.Thread(target=run_event_loop, daemon=True, name="AsyncIO-Loop")
-        loop_thread.start()
-        
-        def process_single_chapter(index, chapter):
-            """处理单个章节（复用事件循环）"""
-            nonlocal completed_count
-            
-            i = index + 1  # 用于显示和文件命名
-            title = chapter.get('title', f"章节{i}")
-            content = chapter.get('content', '')
-            
-            # 生成安全的文件名
-            safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
-            if not safe_title:
-                safe_title = f"章节{i}"
-            if len(safe_title) > 200:
-                safe_title = safe_title[:197] + "..."
-            
-            output_mp3 = os.path.join(output_dir, f"{i:03d}-{safe_title}.mp3")
-            output_lrc = os.path.join(output_dir, f"{i:03d}-{safe_title}.lrc")
-            
-            # 检查空章节
+
+        # -------- 纯逻辑：章节处理（不触碰 Tk 状态） --------
+        state = {"done": 0}
+        results = {}        # 章节索引 -> 成功生成的 MP3 路径
+        local_failed = {}   # 章节索引 -> 失败详情
+        state_lock = threading.Lock()
+
+        def resolve_index(position):
+            """子集任务的位置 -> 原书章节序号"""
+            if 0 <= position < len(chapter_indices):
+                return chapter_indices[position]
+            return position
+
+        def chapter_paths(index, title):
+            safe_title = sanitize_filename(title) or f"章节{index + 1}"
+            base = f"{index + 1:03d}-{safe_title}"
+            return (os.path.join(output_dir, base + ".mp3"),
+                    os.path.join(output_dir, base + ".lrc"))
+
+        def record_failure(index, title, reason, mp3_path=None, lrc_path=None):
+            detail = {"index": index, "title": title, "reason": reason}
+            if mp3_path:
+                detail["mp3_path"] = mp3_path
+            if lrc_path:
+                detail["lrc_path"] = lrc_path
+            with state_lock:
+                local_failed[index] = detail
+            self.message_queue.put(("failed_chapter", dict(detail)))
+
+        def record_success(index, mp3_path):
+            with state_lock:
+                results[index] = mp3_path
+                local_failed.pop(index, None)
+
+        def bump_progress():
+            with state_lock:
+                state["done"] += 1
+                done = state["done"]
+            self.message_queue.put(("progress", int(done / total_chapters * 100)))
+            self.message_queue.put((
+                "batch_progress", (done, len(chapters))))
+
+        async def run_one(position, chapter, semaphore):
+            index = resolve_index(position)
+            title = chapter.get("title", f"章节{index + 1}")
+            content = chapter.get("content", "")
+            output_mp3, output_lrc = chapter_paths(index, title)
+
             if not content.strip():
-                self.message_queue.put(("log", f"[线程{th.current_thread().name[-1]}] 跳过空章节: {title}"))
-                with lock:
-                    completed_count += 1
-                    progress_pct = int(completed_count / len(chapters) * 100)
-                    self.message_queue.put(("progress", progress_pct))
-                    self.message_queue.put(("status", f"处理中: {completed_count}/{len(chapters)}"))
-                return None
-            
-            try:
-                self.message_queue.put(("log", f"[线程{th.current_thread().name[-1]}] 处理: {title}"))
-                
-                # 使用共享的事件循环执行TTS转换（线程安全）
-                # 通过 run_coroutine_threadsafe 在事件循环线程中执行协程
-                future = asyncio.run_coroutine_threadsafe(
-                    process_text_to_mp3(
-                        content,
-                        output_mp3,
-                        output_lrc,
-                        voice,
-                        chars_per_line
-                    ),
-                    event_loop
-                )
-                result = future.result()  # 阻塞等待结果
-                
-                if result:
-                    # 添加ID3标签
-                    if update_mp3_tag(output_mp3, output_lrc, cover_data, title, artist, album):
-                        self.message_queue.put(("log", f"[线程{th.current_thread().name[-1]}] 完成: {title}"))
-                        return_value = output_mp3
+                self.message_queue.put(("log", f"跳过空章节: {title}"))
+                bump_progress()
+                return
+
+            async with semaphore:
+                try:
+                    self.message_queue.put((
+                        "log", f"处理: {title}（{len(content)} 字，"
+                               f"{len(chunk_text(content))} 个分块）"))
+                    success = await process_text_to_mp3(
+                        content, output_mp3, output_lrc, voice, chars_per_line,
+                        tts_engine=tts_engine,
+                    )
+                    if success:
+                        if update_mp3_tag(output_mp3, output_lrc, cover_data,
+                                          title, artist, album):
+                            self.message_queue.put(("log", f"完成: {title}"))
+                        else:
+                            self.message_queue.put(
+                                ("log", f"生成成功但标签失败: {title}"))
+                            record_failure(index, title, "ID3标签添加失败",
+                                           output_mp3, output_lrc)
+                        record_success(index, output_mp3)
                     else:
-                        self.message_queue.put(("log", f"[线程{th.current_thread().name[-1]}] 生成成功但标签失败: {title}，稍后将自动重试添加标签"))
-                        return_value = output_mp3
-                        # 记录标签失败
-                        self.message_queue.put(("failed_chapter", {
-                            "index": index, 
-                            "title": title, 
-                            "reason": "ID3标签添加失败", 
-                            "mp3_path": output_mp3, 
-                            "lrc_path": output_lrc
-                        }))
-                else:
-                    self.message_queue.put(("log", f"[线程{th.current_thread().name[-1]}] 生成失败: {title}，稍后将自动重试"))
-                    # 记录失败
-                    self.message_queue.put(("failed_chapter", {
-                        "index": index, 
-                        "title": title, 
-                        "reason": "MP3生成失败"
-                    }))
-                    return_value = None
-                
-                with lock:
-                    completed_count += 1
-                    progress_pct = int(completed_count / len(chapters) * 100)
-                    self.message_queue.put(("progress", progress_pct))
-                    self.message_queue.put(("status", f"处理中: {completed_count}/{len(chapters)}"))
-                
-                return return_value
-                
-            except Exception as e:
-                self.message_queue.put(("log", f"[线程{th.current_thread().name[-1]}] 处理出错: {title} - {str(e)}"))
-                self.message_queue.put(("failed_chapter", {
-                    "index": index, 
-                    "title": title, 
-                    "reason": f"异常: {str(e)}"
-                }))
-                with lock:
-                    completed_count += 1
-                    progress_pct = int(completed_count / len(chapters) * 100)
-                    self.message_queue.put(("progress", progress_pct))
-                    self.message_queue.put(("status", f"处理中: {completed_count}/{len(chapters)}"))
-                return None
-        
+                        # 带上原因：以前只写章节名，弹窗却让用户"查看日志了解详情"，
+                        # 而窗口模式下原因根本没被记下来过
+                        reason = ' '.join((LAST_TTS_FAILURE or '').split())
+                        self.message_queue.put(("log", f"生成失败: {title}"))
+                        if reason:
+                            self.message_queue.put(("log", "  原因: " + reason[:300]))
+                        record_failure(
+                            index, title,
+                            "MP3生成失败" + ("（" + reason[:200] + "）" if reason else ""))
+                except Exception as e:
+                    self.message_queue.put(("log", f"处理出错: {title} - {e}"))
+                    traceback.print_exc()
+                    record_failure(index, title, f"异常: {e}")
+                finally:
+                    bump_progress()
+
+        async def run_batch(indices):
+            """按索引并发处理，事件循环生命周期由 asyncio.run 托管"""
+            # 分块级并发交给 asyncio，避免线程池与事件循环混用
+            semaphore = asyncio.Semaphore(concurrent_threads)
+            await asyncio.gather(
+                *(run_one(pos, chapters[pos], semaphore) for pos in indices))
+
         try:
-            # 使用线程池并行处理
-            with ThreadPoolExecutor(max_workers=concurrent_threads, thread_name_prefix="TTS-Worker") as executor:
-                # 提交所有任务
-                future_to_index = {executor.submit(process_single_chapter, idx, ch): idx 
-                                  for idx, ch in enumerate(chapters)}
-                
-                # 等待完成并收集结果
-                for future in as_completed(future_to_index):
-                    index = future_to_index[future]
+            # -------- 第一轮 --------
+            pending = [pos for pos, ch in enumerate(chapters) if ch.get("content", "").strip()]
+            asyncio.run(run_batch(pending))
+
+            # -------- 自动重试一轮（按索引回填，绝不 append） --------
+            if local_failed and not params.get("is_retry"):
+                retry_indices = sorted(local_failed)
+                self.message_queue.put(("log", "=" * 50))
+                self.message_queue.put((
+                    "log", f"检测到 {len(retry_indices)} 个章节处理失败，自动重试一轮..."))
+                self.message_queue.put(("log", "=" * 50))
+
+                async def retry_one(index):
+                    chapter = chapters[index]
+                    title = chapter.get("title", f"章节{index + 1}")
+                    output_mp3, output_lrc = chapter_paths(index, title)
+                    reason = local_failed.get(index, {}).get("reason", "")
                     try:
-                        result_mp3 = future.result()
-                        if result_mp3:
-                            mp3_files[index] = result_mp3
+                        if reason == "ID3标签添加失败" and os.path.exists(output_mp3):
+                            if update_mp3_tag(output_mp3, output_lrc, cover_data,
+                                              title, artist, album):
+                                self.message_queue.put(
+                                    ("log", f"[自动重试成功] 标签已补: {title}"))
+                                record_success(index, output_mp3)
+                            else:
+                                self.message_queue.put(
+                                    ("log", f"[自动重试失败] 标签仍失败: {title}"))
+                        else:
+                            self.message_queue.put(("log", f"[自动重试] {title}"))
+                            success = await process_text_to_mp3(
+                                chapter.get("content", ""), output_mp3, output_lrc,
+                                voice, chars_per_line, tts_engine=tts_engine,
+                            )
+                            if success and update_mp3_tag(output_mp3, output_lrc,
+                                                          cover_data, title, artist, album):
+                                self.message_queue.put(
+                                    ("log", f"[自动重试成功] {title}"))
+                                record_success(index, output_mp3)
+                            else:
+                                self.message_queue.put(
+                                    ("log", f"[自动重试失败] {title}"))
                     except Exception as e:
-                        self.message_queue.put(("log", f"线程异常: 章节{index+1} - {str(e)}"))
-            
-            # 过滤掉None值，只保留成功生成的MP3，同时保留对应的章节信息
-            valid_mp3_data = [(mp3, chapters[i]) for i, mp3 in enumerate(mp3_files) if mp3 is not None]
-            mp3_files = [item[0] for item in valid_mp3_data]
-            valid_chapter_titles = [item[1]['title'] for item in valid_mp3_data]
-            
-            # 如果选择M4B格式，合并所有MP3
+                        self.message_queue.put(("log", f"[自动重试异常] {title} - {e}"))
+
+                asyncio.run(run_coros_with_limit(
+                    (retry_one(index) for index in retry_indices), concurrent_threads))
+
+            # -------- 结果整理：严格按章节顺序重建，保证 MP3 与标题一一对应 --------
+            ordered_indices = sorted(results)
+            mp3_files = [results[i] for i in ordered_indices]
+            valid_chapter_titles = [
+                chapters[i].get("title", f"章节{i + 1}") for i in ordered_indices]
+
             if output_format == "M4B" and mp3_files:
-                self.message_queue.put(("log", "="*50))
+                self.message_queue.put(("log", "=" * 50))
                 self.message_queue.put(("log", f"开始合并 {len(mp3_files)} 个章节为M4B格式..."))
                 self.message_queue.put(("status", "正在合并为M4B..."))
-                
-                # 生成安全的文件名
-                safe_title = re.sub(r'[\\/*?:"<>|]', "", book_title)
-                if not safe_title:
-                    safe_title = "有声书"
+
+                safe_title = sanitize_filename(book_title) or "有声书"
                 m4b_output = os.path.join(output_dir, f"{safe_title}.m4b")
-                
+
                 metadata = {
                     'title': book_title,
                     'author': artist,
                     'album': album
                 }
-                
-                success, error_msg = merge_mp3_to_m4b(mp3_files, m4b_output, metadata, cover_data, ffmpeg_path, 
-                                   valid_chapter_titles)
-                
+
+                success, error_msg = merge_mp3_to_m4b(
+                    mp3_files, m4b_output, metadata, cover_data, ffmpeg_path,
+                    valid_chapter_titles)
+
                 if success:
                     self.message_queue.put(("log", f"M4B文件生成成功: {os.path.basename(m4b_output)}"))
                     self.message_queue.put(("log", "正在清理临时MP3文件..."))
-                    
-                    # 删除临时MP3和LRC文件
+
                     for mp3_file in mp3_files:
                         try:
                             if os.path.exists(mp3_file):
                                 os.remove(mp3_file)
-                            lrc_file = mp3_file.replace('.mp3', '.lrc')
+                            lrc_file = os.path.splitext(mp3_file)[0] + ".lrc"
                             if os.path.exists(lrc_file):
                                 os.remove(lrc_file)
                         except Exception as e:
                             self.message_queue.put(("log", f"清理文件失败: {e}"))
-                    
+
                     self.message_queue.put(("log", "临时文件清理完成"))
                 else:
-                    self.message_queue.put(("log", "="*50))
+                    self.message_queue.put(("log", "=" * 50))
                     self.message_queue.put(("log", "M4B合并失败，保留原始MP3文件"))
                     if error_msg:
                         self.message_queue.put(("log", f"失败原因: {error_msg}"))
-                    self.message_queue.put(("log", "="*50))
-            
+                    self.message_queue.put(("log", "=" * 50))
+
             elapsed = time.time() - start_time
             elapsed_str = f"{elapsed:.2f} 秒"
             self.message_queue.put(("progress", 100))
-            
-            # 统计失败和成功的章节数
-            failed_count = len(self.failed_chapters)
+
+            # 统计失败和成功的章节数（以本章任务的索引结果为准，不用全局列表）
             success_count = len(mp3_files)
-            
-            # 自动重试失败的章节
-            if failed_count > 0 and not params.get("is_retry"):
-                self.message_queue.put(("log", "="*50))
-                self.message_queue.put(("log", f"检测到 {failed_count} 个章节处理失败，开始自动重试..."))
-                self.message_queue.put(("log", "="*50))
-                
-                # 记录自动重试前的失败章节
-                retry_failed = list(self.failed_chapters)
-                # 清空失败列表，准备记录新的失败
-                self.failed_chapters.clear()
-                
-                # 为重试创建一个新的事件循环
-                retry_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(retry_loop)
-                
-                try:
-                    for fc in retry_failed:
-                        chapter_index = fc.get('index')
-                        if chapter_index is None or chapter_index < 0 or chapter_index >= len(chapters):
-                            continue
-                        
-                        chapter = chapters[chapter_index]
-                        title = chapter.get('title', f"章节{chapter_index+1}")
-                        content = chapter.get('content', '')
-                        
-                        if not content.strip():
-                            continue
-                        
-                        safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
-                        if not safe_title:
-                            safe_title = f"章节{chapter_index+1}"
-                        if len(safe_title) > 200:
-                            safe_title = safe_title[:197] + "..."
-                        
-                        output_mp3 = os.path.join(output_dir, f"{chapter_index+1:03d}-{safe_title}.mp3")
-                        output_lrc = os.path.join(output_dir, f"{chapter_index+1:03d}-{safe_title}.lrc")
-                        
-                        self.message_queue.put(("log", f"[自动重试] {title}"))
-                        
-                        # 如果是标签失败，直接重试添加标签
-                        if fc.get('reason') == "ID3标签添加失败" and fc.get('mp3_path'):
-                            if update_mp3_tag(fc['mp3_path'], fc['lrc_path'], cover_data, title, artist, album):
-                                self.message_queue.put(("log", f"[自动重试成功] 标签已添加: {title}"))
-                            else:
-                                self.message_queue.put(("log", f"[自动重试失败] 标签仍然失败: {title}"))
-                                self.failed_chapters.append(fc)  # 仍然失败，重新记录
-                        # 如果是MP3生成失败，重新生成
-                        else:
-                            result = retry_loop.run_until_complete(
-                                process_text_to_mp3(
-                                    content,
-                                    output_mp3,
-                                    output_lrc,
-                                    voice,
-                                    chars_per_line
-                                )
-                            )
-                            
-                            if result:
-                                if update_mp3_tag(output_mp3, output_lrc, cover_data, title, artist, album):
-                                    self.message_queue.put(("log", f"[自动重试成功] {title}"))
-                                    mp3_files.append(output_mp3)  # 添加到成功列表
-                                else:
-                                    self.message_queue.put(("log", f"[自动重试成功] 但标签失败: {title}"))
-                                    mp3_files.append(output_mp3)
-                                    self.failed_chapters.append({"index": chapter_index, "title": title, "reason": "ID3标签添加失败", "mp3_path": output_mp3, "lrc_path": output_lrc})
-                            else:
-                                self.message_queue.put(("log", f"[自动重试失败] {title}"))
-                                self.failed_chapters.append(fc)  # 仍然失败，重新记录
-                finally:
-                    retry_loop.close()
-                
-                # 更新统计
-                failed_count = len(self.failed_chapters)
-                success_count = len(mp3_files)
-                
-                if failed_count > 0:
-                    self.message_queue.put(("log", f"自动重试完成，仍有 {failed_count} 个章节失败"))
-                else:
-                    self.message_queue.put(("log", "自动重试完成，所有章节处理成功！"))
-            
+            failed_count = len(local_failed)
+            with self.failed_chapters_lock:
+                self.failed_chapters[:] = [local_failed[i] for i in sorted(local_failed)]
+
             if output_format == "M4B":
                 self.message_queue.put(("status", f"M4B生成完成（耗时 {elapsed_str}）"))
                 self.message_queue.put(("log", f"M4B有声书生成完成!"))
             else:
-                self.message_queue.put(("status", f"批量生成完成: {success_count}/{len(chapters)}（耗时 {elapsed_str}）"))
+                self.message_queue.put((
+                    "status",
+                    f"批量生成完成: {success_count}/{len(chapters)}（耗时 {elapsed_str}）"))
                 self.message_queue.put(("log", f"所有章节有声书生成完成!"))
-            
+
             self.message_queue.put(("log", f"本次批量生成总耗时：{elapsed_str}"))
             if failed_count > 0:
                 self.message_queue.put(("log", f"警告: 自动重试后仍有 {failed_count} 个章节处理失败"))
@@ -4155,7 +5665,7 @@ class EpubToMp3App:
                 if failed_count > 0:
                     msg += f"\n\n警告: 自动重试后仍有 {failed_count} 个章节处理失败\n可以点击'重新处理失败章节'按钮手动重试"
                 msg += "\n\n是否打开输出目录？"
-                
+
                 if messagebox.askyesno("生成完成", msg):
                     try:
                         os.startfile(output_dir)
@@ -4163,20 +5673,17 @@ class EpubToMp3App:
                         messagebox.showerror("打开目录失败", str(e))
 
             self.root.after(0, ask_open_dir)
-
         except Exception as e:
             self.message_queue.put(("log", f"批量生成任务出错: {str(e)}"))
             self.message_queue.put(("status", f"批量生成错误: {str(e)}"))
             traceback.print_exc()
             self.root.after(0, lambda: messagebox.showerror("批量生成错误", str(e)))
         finally:
-            # 停止事件循环
-            event_loop.call_soon_threadsafe(event_loop.stop)
-            loop_thread.join(timeout=2.0)
-            event_loop.close()
-            
-            self.processing = False
+            # 事件循环已由 asyncio.run 负责创建与关闭，此处只需恢复 UI 状态
+            self.end_processing()
             self.root.after(0, lambda: self.generate_ebook_button.config(state="normal"))
+            self.root.after(0, lambda: self.merge_to_m4b_button.config(state="normal"))
+            self.root.after(0, lambda: self.batch_txt_button.config(state="normal"))
 
     def batch_convert_txt_dialog(self):
         """显示TXT批量转换对话框"""
@@ -4219,15 +5726,18 @@ class EpubToMp3App:
             "input_dir": input_dir,
             "output_dir": output_dir,
             "txt_files": txt_files,
-            "voice": self.voice_var.get(),
+            "voice": self.get_selected_voice_code(),
             "chars_per_line": self.chars_per_line_var.get(),
             "artist": self.artist_var.get(),
             "album": self.album_var.get(),
-            "cover_data": cover_data
+            "cover_data": cover_data,
+            "tts_engine": self.tts_engine_var.get()  # 同样必须带上引擎
         }
         
-        # 启动后台线程
-        self.processing = True
+        # 启动后台线程：原子占用，避免与其他批次互相覆盖输出
+        if not self.try_begin_processing():
+            messagebox.showwarning("处理中", "有转换任务正在进行，请等待完成。")
+            return
         self.generate_ebook_button.config(state="disabled")
         self.batch_txt_button.config(state="disabled")
         self.merge_to_m4b_button.config(state="disabled")
@@ -4251,22 +5761,30 @@ class EpubToMp3App:
         artist = params["artist"]
         album = params["album"]
         cover_data = params["cover_data"]
+        tts_engine = params.get("tts_engine") or AppConfig.DEFAULT_TTS_ENGINE
+
+        total_files = len(txt_files) or 1
+        processed_count = 0
+        failed_files = []
 
         self.message_queue.put(("log", f"开始批量转换 {len(txt_files)} 个文件"))
+        self.message_queue.put(("log", f"TTS引擎: {tts_engine}"))
         self.message_queue.put(("status", f"批处理中: 0/{len(txt_files)}"))
 
         # 创建异步任务循环
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
+        def bump_progress(status_text=None):
+            nonlocal processed_count
+            processed_count += 1
+            self.message_queue.put(("progress", int(processed_count / total_files * 100)))
+            self.message_queue.put((
+                "status", status_text or f"批处理中: {processed_count}/{len(txt_files)}"))
+
         try:
             # 遍历处理每个文件
-            for i, txt_file in enumerate(txt_files):
-                # 更新进度
-                progress_pct = int((i / len(txt_files)) * 100)
-                self.message_queue.put(("progress", progress_pct))
-                self.message_queue.put(("status", f"批处理中: {i}/{len(txt_files)}"))
-
+            for txt_file in txt_files:
                 # 获取文件基本名称和路径
                 base_name = os.path.splitext(txt_file)[0]
                 txt_path = os.path.join(input_dir, txt_file)
@@ -4281,6 +5799,7 @@ class EpubToMp3App:
                     if os.path.exists(output_lrc):
                         update_mp3_tag(output_mp3, output_lrc, cover_data, base_name, artist, album)
 
+                    bump_progress()
                     continue
 
                 # 读取文本内容
@@ -4290,19 +5809,21 @@ class EpubToMp3App:
 
                     if not content.strip():
                         self.message_queue.put(("log", f"跳过空文件: {txt_file}"))
+                        bump_progress()
                         continue
 
                     # 生成MP3和LRC
                     self.message_queue.put(("log", f"处理: {txt_file}"))
 
-                    # 异步执行TTS转换
+                    # 异步执行TTS转换（带上用户选择的引擎）
                     result = loop.run_until_complete(
                         process_text_to_mp3(
                             content,
                             output_mp3,
                             output_lrc,
                             voice,
-                            chars_per_line
+                            chars_per_line,
+                            tts_engine=tts_engine
                         )
                     )
 
@@ -4312,23 +5833,34 @@ class EpubToMp3App:
                             self.message_queue.put(("log", f"完成: {txt_file}"))
                         else:
                             self.message_queue.put(("log", f"生成成功但标签失败: {txt_file}"))
+                            failed_files.append(txt_file)
                     else:
                         self.message_queue.put(("log", f"生成失败: {txt_file}"))
+                        failed_files.append(txt_file)
 
                 except Exception as e:
                     self.message_queue.put(("log", f"处理文件 '{txt_file}' 时出错: {str(e)}"))
                     traceback.print_exc()
+                    failed_files.append(txt_file)
+
+                bump_progress()
 
             # 完成所有处理
             self.message_queue.put(("progress", 100))
-            self.message_queue.put(("status", f"批处理完成: {len(txt_files)}/{len(txt_files)}"))
+            self.message_queue.put((
+                "status", f"批处理完成: {len(txt_files) - len(failed_files)}/{len(txt_files)}"))
             self.message_queue.put(("log", "批量转换完成!"))
+            if failed_files:
+                self.message_queue.put((
+                    "log", f"失败 {len(failed_files)} 个: {', '.join(failed_files[:10])}"))
             
             # 弹窗提示
             def show_complete_msg():
-                messagebox.showinfo("批量转换完成",
-                                  f"完成 {len(txt_files)} 个TXT文件批量转换\n"
-                                  f"输出目录: {output_dir}")
+                message = (f"完成 {len(txt_files) - len(failed_files)}/{len(txt_files)} "
+                           f"个TXT文件批量转换\n输出目录: {output_dir}")
+                if failed_files:
+                    message += f"\n\n失败 {len(failed_files)} 个，详见运行日志"
+                messagebox.showinfo("批量转换完成", message)
             self.root.after(0, show_complete_msg)
 
         except Exception as e:
@@ -4338,9 +5870,12 @@ class EpubToMp3App:
             self.root.after(0, lambda: messagebox.showerror("批处理错误", str(e)))
 
         finally:
-            loop.close()
+            try:
+                loop.close()
+            except Exception:
+                pass
             # 恢复UI状态
-            self.processing = False
+            self.end_processing()
             self.root.after(0, lambda: self.generate_ebook_button.config(state="normal"))
             self.root.after(0, lambda: self.batch_txt_button.config(state="normal"))
             self.root.after(0, lambda: self.merge_to_m4b_button.config(state="normal"))
@@ -4365,11 +5900,13 @@ class EpubToMp3App:
             messagebox.showerror("错误", "没有可用的电子书章节。请先加载EPUB文件。")
             return
         
-        # 显示失败章节列表
+        # 显示失败章节列表（复制一份，避免与后台线程同时读写）
+        with self.failed_chapters_lock:
+            snapshot = list(self.failed_chapters)
         failed_list = "\n".join([f"  - {fc['title']} ({fc.get('reason', '未知错误')})" 
-                                 for fc in self.failed_chapters])
+                                 for fc in snapshot])
         msg = (
-            f"共有 {len(self.failed_chapters)} 个章节处理失败：\n\n"
+            f"共有 {len(snapshot)} 个章节处理失败：\n\n"
             f"{failed_list}\n\n"
             f"是否重新处理这些失败的章节？"
         )
@@ -4377,12 +5914,14 @@ class EpubToMp3App:
         if not messagebox.askyesno("重新处理失败章节", msg):
             return
         
-        # 准备重试的章节
+        # 准备重试的章节（同时保留它们在原书中的真实序号）
         retry_chapters_data = []
-        for fc in self.failed_chapters:
+        retry_chapter_indices = []
+        for fc in snapshot:
             chapter_index = fc.get('index')
             if chapter_index is not None and 0 <= chapter_index < len(self.epub_data['chapters']):
                 retry_chapters_data.append(self.epub_data['chapters'][chapter_index])
+                retry_chapter_indices.append(chapter_index)
         
         if not retry_chapters_data:
             messagebox.showerror("错误", "无法找到失败章节的有效数据。")
@@ -4415,7 +5954,8 @@ class EpubToMp3App:
         params = {
             "output_dir": output_dir,
             "chapters": retry_chapters_data,
-            "voice": self.voice_var.get(),
+            "chapter_indices": retry_chapter_indices,  # 保留原书序号，文件名与首次一致
+            "voice": self.get_selected_voice_code(),
             "chars_per_line": self.chars_per_line_var.get(),
             "artist": self.artist_var.get(),
             "album": self.album_var.get(),
@@ -4423,11 +5963,15 @@ class EpubToMp3App:
             "output_format": "MP3",  # 重试时只生成MP3，不合并
             "book_title": self.epub_data['title'],
             "ffmpeg_path": self.ffmpeg_path,
+            "tts_engine": self.tts_engine_var.get(),
+            "concurrent_threads": self.concurrent_threads_var.get(),
             "is_retry": True  # 标记这是重试任务
         }
         
-        # 禁用按钮
-        self.processing = True
+        # 禁用按钮（原子占用，避免与其他批次冲突）
+        if not self.try_begin_processing():
+            messagebox.showwarning("处理中", "有转换任务正在进行，请等待完成。")
+            return
         self.generate_ebook_button.config(state="disabled")
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, "\n" + "="*50 + "\n")
@@ -4439,6 +5983,39 @@ class EpubToMp3App:
         # 启动后台线程重试
         threading.Thread(target=self._generate_ebook_thread, args=(params,), daemon=True).start()
 
+    def _teardown(self):
+        """停止后台、保存设置、清理本实例临时目录（**不碰 Tk**）
+
+        两个要点：
+
+        1. `_stopping` 必须**最先**立起来，之后消息泵不再续期，界面也不再被
+           后台消息改写；
+        2. 每一步各自兜住异常，任何一步失败都不能中断剩下的收尾。
+
+        第 2 点是被真实故障逼出来的：打包成窗口模式后，逃到顶层的异常会被
+        PyInstaller 弹成 "Failed to execute script ... unhandled exception"
+        错误框（实测出现过 `can't invoke "wm" command: application has been
+        destroyed`），用户看到的是吓人的报错，而设置根本没来得及保存。
+
+        刻意不碰 Tk，所以窗口已经销毁时（main() 启动序列里就被关掉）也能调，
+        main() 的兜底分支正是复用它。
+        """
+        # 先立停止标志：此后消息泵不再续期
+        self._stopping = True
+
+        # *** 停止任务调度器 / 保存设置 / 清理本实例临时目录 ***
+        # 只清理本实例的目录：共享 TEMP_DIR 可能正被其他实例使用，
+        # 直接 rmtree 会删掉别人正在写入的文件
+        for label, action in (
+            ("停止任务调度器", self.task_scheduler.stop),
+            ("保存设置", self.save_settings),
+            ("清理临时目录", self.cleanup_session_temp_dir),
+        ):
+            try:
+                action()
+            except Exception:
+                self.logger.warning("退出时%s失败（已跳过）", label, exc_info=True)
+
     def on_closing(self):
         """处理窗口关闭事件，始终弹窗确认"""
         if self.processing:
@@ -4448,25 +6025,21 @@ class EpubToMp3App:
         if not messagebox.askyesno("确认退出", msg):
             return
 
-        # *** 停止任务调度器 ***
-        self.task_scheduler.stop()
-        
-        # 清理临时文件夹
+        self._teardown()
+
         try:
-            if os.path.exists(TEMP_DIR):
-                shutil.rmtree(TEMP_DIR)
-        except:
+            self.root.destroy()
+        except tk.TclError:
             pass
 
-        self.root.destroy()
-
     def calculate_estimated_time(self):
-        """计算预计耗时，基于字数"""
+        """计算预计耗时，基于字数（使用与 LRC 估算同一个速度常量）"""
         if not self.epub_data or 'total_words' not in self.epub_data:
             return "00:00:00"
 
         total_words = self.epub_data['total_words']
-        total_seconds = int(total_words / 80 + 0.5)  # 四舍五入
+        # 与 AppConfig.CHARS_PER_SECOND 保持一致，避免两个互相矛盾的估算
+        total_seconds = int(total_words / AppConfig.CHARS_PER_SECOND + 0.5)
 
         hours, remainder = divmod(total_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
@@ -4474,22 +6047,64 @@ class EpubToMp3App:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _install_exception_hooks(log_path):
+    """安装全局异常钩子：GUI 回调里的异常此前只会打印到 stderr，容易丢"""
+    def report(exc_type, exc_value, exc_tb):
+        text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(text, file=sys.stderr)
+        try:
+            with open(log_path, 'a', encoding='utf-8') as fh:
+                fh.write(f"\n[{datetime.now().isoformat()}] 未捕获异常\n{text}")
+        except Exception:
+            pass
+
+    sys.excepthook = report
+    if hasattr(threading, 'excepthook'):
+        threading.excepthook = lambda args: report(
+            args.exc_type, args.exc_value, args.exc_traceback)
+
+
 def main():
     """主函数"""
+    # 统一日志：文件轮转 + stderr，便于事后排查（原来只有 print/traceback）
+    logger = setup_logging()
+    logger.info("epubReader 启动，日志文件: %s", AppConfig.LOG_PATH)
+    _install_exception_hooks(AppConfig.LOG_PATH)
+
     # 创建并启动应用
     root = tk.Tk()
+    # 先让窗口完成映射再取消置顶，否则可能从未置顶过
     root.attributes("-topmost", True)
+    root.update_idletasks()
     app = EpubToMp3App(root)
 
     # 居中窗口
-    app.center_window()
-    root.update_idletasks()
+    #
+    # 从这里开始窗口已经可见，必须防住"初始化期间窗口就被关掉"：慢启动时用户
+    # （或自动化脚本）完全可能在 main() 走完之前点关闭，Tk 的默认行为会直接
+    # 销毁窗口，此后**任何** Tk 调用都会抛
+    #   TclError: can't invoke "wm" command: application has been destroyed
+    # 而 main() 里这几步没人兜，异常逃到顶层；打包成窗口模式后会被 PyInstaller
+    # 弹成 "Failed to execute script 'epubReader' due to unhandled exception"
+    # 报错框——用户看到的是崩溃，实际上设置本该正常保存。实测 traceback：
+    #   File "epubReader.py", line 6018, in main
+    #   _tkinter.TclError: can't invoke "wm" command: application has been destroyed
+    # 注意 `root.update()` 本身就会处理排队中的 WM_CLOSE，销毁发生在那一步之内，
+    # 所以 center_window/update 这段也要一起兜。
+    try:
+        app.center_window()
+        root.update()
+    except tk.TclError:
+        app._teardown()
+        return
 
-    # 取消置顶，仅在首次显示时置顶
-    root.attributes("-topmost", False)
-
-    # 设置窗口关闭处理
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    # 取消置顶 + 装上关闭处理器（仅在首次显示时置顶）
+    try:
+        root.attributes("-topmost", False)
+        root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    except tk.TclError:
+        app._teardown()
+        return
 
     # 启动主循环
     root.mainloop()
@@ -4497,6 +6112,10 @@ def main():
 
 if __name__ == "__main__":
     if sys.platform == "win32" and sys.executable.endswith("pythonw.exe"):
-        sys.stdout = open(os.path.join(os.getenv("TEMP"), "epubReader_stdout.log"), "w")
-        sys.stderr = open(os.path.join(os.getenv("TEMP"), "epubReader_stderr.log"), "w")
+        # 行缓冲 + 统一编码，避免崩溃时日志停在缓冲区里
+        log_dir = os.getenv("TEMP") or tempfile.gettempdir()
+        sys.stdout = open(os.path.join(log_dir, "epubReader_stdout.log"),
+                          "w", encoding="utf-8", buffering=1)
+        sys.stderr = open(os.path.join(log_dir, "epubReader_stderr.log"),
+                          "w", encoding="utf-8", buffering=1)
     main()

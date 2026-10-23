@@ -1,13 +1,28 @@
-ebooklib>=0.18
-beautifulsoup4>=4.11.0
-Pillow>=9.0.0
-edge-tts>=6.1.0
-mutagen>=1.46.0
-requests>=2.28.0
-aiohttp>=3.8.0
-lxml>=4.9.0
-pygame>=2.1.0
+# 运行期依赖（目标解释器：Python 3.8，项目在 3.8.8 上开发与打包）
+#
+# edge-tts 的版本要留意：微软会改 Sec-MS-GEC-Version 的校验方案，
+# 旧版发 '1-' 前缀会被服务端 403 拒绝。7.3.x 发 '2-'，可用。
+# 若将来出现 403，先试 `pip install -U edge-tts`。
+edge-tts==7.3.1
 
-# 可选TTS引擎（按需安装）
-gTTS>=2.3.0  # Google TTS
-pyttsx3>=2.90  # 离线TTS
+# HTTP / 证书
+aiohttp==3.10.11
+certifi>=2023.11.17
+
+# EPUB 解析
+EbookLib==0.18
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+# MP3 ID3 标签、时长解析
+mutagen==1.47.0
+
+# 封面处理
+Pillow==10.4.0
+
+# edge-tts 依赖
+tabulate==0.9.0
+typing_extensions>=4.1.0
+
+# 打包
+# pyinstaller==5.13.2
